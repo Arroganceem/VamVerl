@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vampo"
+version = "0.2.0"
+description = "VAMPO: WMPO-style GRPO/PPO on video-action world models (VideoMAE reward + verl)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=2,<2.5",
+    "omegaconf",
+    "transformers>=4.40",
+    "safetensors",
+    "pillow",
+    "tqdm",
+    "pyyaml",
+    "opencv-python-headless>=4.13.0",
+    "msgpack",
+    "websockets",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+vla = [
+    "einops>=0.8",
+    "tyro",
+    "tianshou>=0.5,<3",
+    "albumentations>=1.4",
+    "openpi-client>=0.1.1",
+    "imageio>=2.34",
+    "imageio-ffmpeg",
+    "diffusers>=0.30",
+    "peft>=0.5",
+    "decord2",
+    "av>=15",
+    "gear",
+]
+verl = [
+    "ray>=2.31",
+    "hydra-core>=1.3",
+    "tensordict>=0.4",
+    "codetiming",
+    "packaging",
+    "pandas",
+    "wandb>=0.16",
+]
+reward = [
+    "webdataset>=0.2",
+    "scikit-learn>=1.3",
+    "wandb>=0.16",
+]
+
+[project.scripts]
+vampo-train = "vampo.integrations.verl.main_vampo_ppo:main_hydra"
+vampo-train-videomae = "vampo.reward.train_videomae:main"
+vampo-bootstrap-init-states = "vampo.data.init_states_bootstrap:main"
+vampo-build-init-states = "vampo.data.droid_to_init_states:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vampo*", "verl*", "groot*", "eval_utils*"]

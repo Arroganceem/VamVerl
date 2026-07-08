@@ -1,0 +1,137 @@
+# 组件 3 · verl GRPO + PPO（正式训练）
+# total_epochs = global PPO step 数（每 step：1 init × n_samples 条轨迹）
+
+vla:
+  model_path: /home/robotem/Models/DreamZero-DROID
+  tokenizer_path: /home/robotem/Models/umt5-xxl
+
+data:
+  backend: vampo
+  init_states_dir: ./data/init_states
+  task_prompt: "pick up the object"
+  primary_camera_key: observation.images.exterior_image_1_left
+  max_wm_steps: 8
+  train_batch_size: 1
+  val_batch_size: 1
+  rollout_batch_size: 1
+  n_samples: 8              # GRPO 组：同起点 8 条轨迹，组内相对比较更稳
+  oversample_factor: 1.0
+  filter_accuracy: false
+  filter_truncated: false
+  filter_warmup: false
+  task_name: vampo
+
+actor_rollout_ref:
+  hybrid_engine: true
+  wm:
+    enable: false
+  data:
+    init_states_dir: ${data.init_states_dir}
+  model:
+    backend: vla
+    path: /home/robotem/Models/DreamZero-DROID
+    # rl_fine_tune_mode: full | lora
+    # 方案 A：只训 projector，冻结 Wan DiT（四机 GB10 推荐）
+    rl_fine_tune_mode: full
+    tune_projector: true
+    tune_diffusion_model: false
+    keep_lora_trainable: false
+    action_horizon: 8
+    action_dim: 8
+    flow_rl_sigma: 0.05
+    flow_rl_video_sigma: 0.05
+    action_token_len: 64
+    action_chunks_len: 1
+  actor:
+    action_token_len: ${actor_rollout_ref.model.action_token_len}
+    action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
+    strategy: fsdp
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size: 1
+    use_dynamic_bsz: false
+    clip_ratio_high: 0.28
+    clip_ratio_low: 0.2
+    entropy_coeff: 0.001
+    grad_clip: 1.0
+    optim:
+      lr: 5.0e-6
+      weight_decay: 0.0
+      total_training_steps: 12288
+    fsdp_config:
+      param_offload: false
+      grad_offload: false
+      optimizer_offload: false
+      wrap_policy:
+        transformer_layer_cls_to_wrap:
+          - CausalWanAttentionBlock
+      fsdp_size: -1
+  ref:
+    fsdp_config:
+      param_offload: false
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+    log_prob_micro_batch_size: 1
+  rollout:
+    name: vampo
+    policy_backend: vla
+    action_horizon: ${actor_rollout_ref.model.action_horizon}
+    action_dim: ${actor_rollout_ref.model.action_dim}
+    imagined_frames: 8
+    max_wm_steps: ${data.max_wm_steps}
+    primary_camera_key: ${data.primary_camera_key}
+    task_prompt: ${data.task_prompt}
+    temperature: 1.0
+    reuse_trace_log_prob: false  # verl hybrid: rollout 只存 trace，gen 后 actor.compute_log_prob 重算
+    log_prob_micro_batch_size: 1
+    log_prob_use_dynamic_bsz: false
+    tensor_model_parallel_size: 1
+  reward:
+    backend: videomae
+    hf_model_id: /home/robotem/Models/videomae-base
+    videomae_checkpoint: ${oc.env:VIDEOMAE_CKPT,./checkpoints/videomae_droid.pth}
+    # threshold: from videomae_droid.json sidecar (~0.37); do not override with WMPO 0.82
+    window_size: 8
+    min_steps: 32
+    img_size: 224
+    batch_size: 32
+    device: null
+
+critic:
+  strategy: fsdp
+
+verifier:
+  reward_coef: 5.0
+
+reward_model:
+  enable: false
+  rm_coef: 0.0
+
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+
+trainer:
+  total_epochs: 12288       # ≈ 4 遍 2888 init_states（每 step 抽 1 个起点）
+  total_training_steps: null
+  project_name: vamverl
+  experiment_name: vampo_verl_grpo_formal
+  logger: [console, wandb]
+  wandb_mode: online
+  nnodes: 1
+  n_gpus_per_node: 1
+  save_freq: 512            # 每 512 step 存 policy.pt
+  test_freq: -1
+  critic_warmup: 0
+  default_local_dir: ./outputs/vampo_verl
+  runtime_env: none
+  val_before_train: false
+  val_only: false
+  debug: false
+  cooldown_every_steps: 1      # 每 N 个 PPO step 冷却一次；0 关闭
+  cooldown_sec: 0              # 冷却秒数；可用 VAMPO_COOLDOWN_SEC 覆盖

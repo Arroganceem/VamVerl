@@ -1,0 +1,45 @@
+# Training / experiment outputs
+outputs/
+wandb/
+*.log
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local data (do not commit large datasets or init states)
+data/
+
+# Checkpoints (weights only; sidecar .json excluded via directory ignore)
+checkpoints/
+
+# Training logs
+logs/
+
+# Cluster / Ray runtime
+/tmp/ray/
+ray_results/
+
+# Secrets
+.env
+.env.*
+*.pem

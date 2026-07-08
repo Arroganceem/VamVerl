@@ -1,0 +1,63 @@
+# 4 机 × 1 GPU · verl 原生 FSDP FULL_SHARD（四卡协同一个模型）
+#
+# 拓扑: nnodes=4 × n_gpus_per_node=1 → world_size=4 FSDP mesh
+#       参数按 DiT block 分片；rollout/update 全组同步（ONE_TO_ALL dispatch）
+#
+# 开训: bash scripts/train_component3_rl_cluster4.sh
+defaults:
+  - vampo_ppo_trainer
+  - _self_
+
+data:
+  max_wm_steps: 4
+  train_batch_size: 1
+  n_samples: 4
+
+actor_rollout_ref:
+  model:
+    rl_fine_tune_mode: lora
+    tune_projector: true
+    tune_diffusion_model: true
+    keep_lora_trainable: true
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size: 1
+    optim:
+      lr: 5.0e-4
+      total_training_steps: 24576
+    fsdp_config:
+      disable: false
+      # false: 一次 FSDP auto-wrap 40 blocks + 单次 sync（~15–25min）
+      # true:  40 次逐 block FSDP+sync，实测 block1 可卡 30min+，勿开
+      sequential_block_wrap: false
+      param_offload: false
+      grad_offload: false
+      optimizer_offload: false
+      wrap_policy:
+        transformer_layer_cls_to_wrap:
+          - CausalWanAttentionBlock
+      fsdp_size: -1
+  rollout:
+    log_prob_micro_batch_size: 4
+    tensor_model_parallel_size: 1
+  reward:
+    backend: videomae
+    hf_model_id: /home/robotem/Models/videomae-base
+    videomae_checkpoint: ${oc.env:VIDEOMAE_CKPT,./checkpoints/videomae_droid.pth}
+    window_size: 8
+    min_steps: 32
+    img_size: 224
+    batch_size: 32
+    device: cuda
+
+trainer:
+  nnodes: 4
+  n_gpus_per_node: 1
+  rank0_node_ip: 192.168.88.31
+  total_epochs: 24576
+  cooldown_every_steps: 1
+  cooldown_sec: 45
+  experiment_name: vampo_verl_grpo_cluster4_fsdp_lora
+  runtime_env: configs/runtime_env_vampo_cluster.json
+  default_local_dir: ./outputs/vampo_verl_cluster4_fsdp_lora

@@ -1,0 +1,29 @@
+name: Staged Verify
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  staged-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package (core + verl deps)
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,verl]"
+
+      - name: Stage 0–3 (static + RL mock + config)
+        run: bash scripts/verify_staged.sh --through 3 --json
+
+      - name: Unit tests (RL pipeline mock)
+        run: pytest tests/test_staged_rl_pipeline.py -q

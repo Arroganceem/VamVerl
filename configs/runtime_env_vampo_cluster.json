@@ -1,0 +1,11 @@
+{
+  "env_vars": {
+    "TOKENIZERS_PARALLELISM": "true",
+    "NCCL_DEBUG": "WARN",
+    "NCCL_IB_DISABLE": "0",
+    "VAMPO_NCCL_TIMEOUT_MIN": "120",
+    "VAMPO_RANK0_NODE_IP": "192.168.88.31",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  }
+}
