@@ -17,7 +17,6 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer
 from transformers.trainer_pt_utils import get_module_class_from_name
 import torch
 import torch.nn as nn
-from verl.utils.vla_utils.openvla_oft.modeling_prismatic import  PrismaticProjector
 
 def init_fn(x: torch.nn.Module):
     if not torch.distributed.get_rank() == 0:
@@ -69,8 +68,8 @@ def get_fsdp_wrap_policy(module, config=None):
     return auto_wrap_policy
 
 def get_fsdp_wrap_policy_vla(module, config=None, is_lora=False):
-    
     from timm.models.vision_transformer import Block, VisionTransformer
+    from verl.utils.vla_utils.openvla_oft.modeling_prismatic import PrismaticProjector
     from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy, transformer_auto_wrap_policy, lambda_auto_wrap_policy
     vit_wrap_policy = functools.partial(_module_wrap_policy, module_classes={VisionTransformer})
     transformer_block_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})

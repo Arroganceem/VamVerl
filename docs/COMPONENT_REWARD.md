@@ -57,7 +57,7 @@ reward:
 3. 确认 API 可用：
 
 ```bash
-bash scripts/preflight_rl.sh --strict-reward
+bash scripts/preflight/preflight_rl.sh --strict-reward
 # 或仅测连通: curl http://192.168.88.41:1234/v1/models
 ```
 

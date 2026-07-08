@@ -1426,6 +1426,37 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = True
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
+    def _resolve_rope_device(self) -> torch.device:
+        weight = self.patch_embedding.weight
+        if not getattr(weight, "is_meta", False):
+            return weight.device
+        if torch.cuda.is_available():
+            return torch.device(torch.cuda.current_device())
+        return torch.device("cpu")
+
+    def _materialize_rope_freqs_if_needed(self, device: torch.device | None = None) -> None:
+        """RoPE tables are plain attrs (not buffers); meta init leaves them empty until this runs."""
+        device = device or self._resolve_rope_device()
+        if not getattr(self.freqs[0], "is_meta", False):
+            if self.freqs_action.device != device:
+                self.freqs_action = self.freqs_action.to(device)
+            if self.freqs_state.device != device:
+                self.freqs_state = self.freqs_state.to(device)
+            if any(freq.device != device for freq in self.freqs):
+                self.freqs = [freq.to(device) for freq in self.freqs]
+            return
+
+        d = self.dim // self.num_heads
+        self.freqs_action = rope_params(1024 * 10, d).to(device)
+        self.freqs_state = rope_params(1024, d).to(device)
+        self.freqs = [
+            rope_params(1024, d - 4 * (d // 6)).to(device),
+            rope_params(1024, 2 * (d // 6)).to(device),
+            rope_params(1024, 2 * (d // 6)).to(device),
+        ]
+
+    def post_initialize(self) -> None:
+        self._materialize_rope_freqs_if_needed()
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -2201,6 +2232,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         start_frame: int,
     ):
         device = self.patch_embedding.weight.device
+        self._materialize_rope_freqs_if_needed(
+            device if not getattr(self.patch_embedding.weight, "is_meta", False) else None
+        )
+        device = self._resolve_rope_device()
         if any(freq.device != device for freq in self.freqs):
             self.freqs = [freq.to(device) for freq in self.freqs]
         if self.freqs_action.device != device:

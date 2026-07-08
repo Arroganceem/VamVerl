@@ -1,55 +1,62 @@
-# 4 机 × 1 GPU · verl 原生 FSDP FULL_SHARD（四卡协同一个模型）
+# 4 机 × 1 GPU · FSDP FULL_SHARD + per-rank sharded checkpoint（rank0 不载整份 DiT）
 #
-# 拓扑: nnodes=4 × n_gpus_per_node=1 → world_size=4 FSDP mesh
-#       参数按 DiT block 分片；rollout/update 全组同步（ONE_TO_ALL dispatch）
+# 首次开训前在 .31 上转换 checkpoint（一次性，rank0 会载整模）:
+#   torchrun --nproc_per_node=4 --nnodes=1 --master_port=29501 \
+#     scripts/checkpoint/convert_dreamzero_fsdp_checkpoint.py \
+#     --model-path /home/robotem/Models/DreamZero-DROID \
+#     --output /home/robotem/Models/DreamZero-DROID-fsdp4
 #
-# 开训: bash scripts/train_component3_rl_cluster4.sh
+# 开训: bash scripts/train/train_component3_rl_cluster4.sh
+# 停训: bash scripts/train/train_component3_rl_cluster4.sh stop
 defaults:
   - vampo_ppo_trainer
   - _self_
 
 data:
-  max_wm_steps: 4
+  max_wm_steps: 1          # 原 4/8；每 traj 仅 1 个 WM chunk
   train_batch_size: 1
-  n_samples: 4
+  n_samples: 2              # GRPO 组最小有效值（原 4/8）
 
 actor_rollout_ref:
   model:
+    # 方案 B：LoRA 微调 DiT + projector（低秩增量，DiT 稠密权重冻结）
     rl_fine_tune_mode: lora
     tune_projector: true
     tune_diffusion_model: true
     keep_lora_trainable: true
   actor:
     strategy: fsdp
-    ppo_mini_batch_size: 4
+    ppo_mini_batch_size: 2  # = n_samples
     ppo_micro_batch_size: 1
     optim:
       lr: 5.0e-4
       total_training_steps: 24576
     fsdp_config:
       disable: false
-      # false: 一次 FSDP auto-wrap 40 blocks + 单次 sync（~15–25min）
-      # true:  40 次逐 block FSDP+sync，实测 block1 可卡 30min+，勿开
-      sequential_block_wrap: false
-      param_offload: false
-      grad_offload: false
-      optimizer_offload: false
+      sequential_block_wrap: true
+      # 每 rank 只读 1/4 DiT；T5/VAE/projector 从 replicated.safetensors 各 rank 加载
+      sharded_checkpoint_dir: ${oc.env:VAMVERL_FSDP_SHARDED_CHECKPOINT,/home/robotem/Models/DreamZero-DROID-fsdp4}
+      # GB10 为 CPU/GPU 共享统一内存池（非独立显存）；峰值 = DiT + KV + 激活 + VideoMAE + Adam
+      param_offload: false       # DiT FSDP 分片常驻；靠 grad/optimizer offload + 分阶段 flush
+      grad_offload: true         # 每个 micro-batch backward 后梯度落 CPU，避免与 rollout 峰值叠加
+      optimizer_offload: true    # Adam 仅在 optimizer.step 前上 GPU
       wrap_policy:
         transformer_layer_cls_to_wrap:
           - CausalWanAttentionBlock
       fsdp_size: -1
   rollout:
-    log_prob_micro_batch_size: 4
+    imagined_frames: 8        # 与 VideoMAE window_size 对齐，reward 无需 pad
+    log_prob_micro_batch_size: 1
     tensor_model_parallel_size: 1
   reward:
     backend: videomae
     hf_model_id: /home/robotem/Models/videomae-base
     videomae_checkpoint: ${oc.env:VIDEOMAE_CKPT,./checkpoints/videomae_droid.pth}
     window_size: 8
-    min_steps: 32
+    min_steps: 8              # 配合 max_wm_steps=1 的短轨迹
     img_size: 224
-    batch_size: 32
-    device: cuda
+    batch_size: 8             # 原 32
+    device: cpu               # 逻辑 CPU；GB10 仍占统一内存池，rollout 后必须 offload
 
 trainer:
   nnodes: 4
@@ -57,7 +64,8 @@ trainer:
   rank0_node_ip: 192.168.88.31
   total_epochs: 24576
   cooldown_every_steps: 1
-  cooldown_sec: 45
-  experiment_name: vampo_verl_grpo_cluster4_fsdp_lora
-  runtime_env: configs/runtime_env_vampo_cluster.json
+  cooldown_sec: 60            # step 结束后释放统一内存
+  pre_update_cooldown_sec: 30 # rollout→update_actor 等待统一内存池回收（可用 VAMPO_PRE_UPDATE_COOLDOWN_SEC 覆盖）
+  experiment_name: vampo_verl_cluster4_fsdp_lora
+  runtime_env: none
   default_local_dir: ./outputs/vampo_verl_cluster4_fsdp_lora

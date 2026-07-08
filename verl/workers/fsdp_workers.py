@@ -3339,7 +3339,11 @@ class PRIMERewardModelWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.reward_module, offload_grad=self._is_offload_grad)
 
-# @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
+
+try:
+    from verl.workers.dreamzero_worker import DreamZeroActorRolloutRefWorker
+except ImportError:
+    DreamZeroActorRolloutRefWorker = None  # type: ignore[misc, assignment]
 # def main(config):
 
 #     print()

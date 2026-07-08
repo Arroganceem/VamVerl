@@ -2,7 +2,7 @@
 
 组件 3 基于 **verl**：Ray 分布式 **in-process 视频-动作模型 rollout** → **VideoMAE** 稀疏 reward → **GRPO** → **PPO 更新 action head 可训子集**（`full` 或 `lora` + projector）。
 
-**入口：** `bash scripts/train_component3_rl.sh`（=`vampo-train`）  
+**入口：** `bash scripts/train/train_component3_rl_cluster4.sh`（=`vamverl-train` / `vampo-train`）  
 **配置：** `configs/vampo_ppo_trainer.yaml`（单机 FSDP）· `configs/vampo_ppo_trainer_cluster4.yaml`（四机 Megatron TP=4 + LoRA）  
 **模型：** `model.backend: vla`，`rollout.policy_backend: vla`
 
@@ -966,9 +966,9 @@ flowchart TB
 ```bash
 conda activate vamverl
 # 训练前检查（模型下载中可先 --skip-reward）
-bash scripts/preflight_rl.sh --skip-reward
-bash scripts/preflight_rl.sh --strict-reward   # LM Studio 就绪后
-bash scripts/train_component3_rl.sh
+bash scripts/preflight/preflight_rl.sh --skip-reward
+bash scripts/preflight/preflight_rl.sh --strict-reward   # LM Studio 就绪后
+bash scripts/train/train_component3_rl_cluster4.sh
 ```
 
 ### 4 机 Ray 集群
@@ -979,19 +979,19 @@ bash scripts/train_component3_rl.sh
 
 ```bash
 # 41 上（无需密码，NFS 已挂载时）
-bash scripts/mount_nfs_cluster4.sh status
-bash scripts/sync_vamverl_cluster.sh
+bash scripts/cluster/mount_nfs_cluster4.sh status
+bash scripts/cluster/sync_vamverl_cluster.sh
 bash scripts/ray/start_ray_head.sh
-bash scripts/train_component3_rl_cluster4.sh
+bash scripts/train/train_component3_rl_cluster4.sh
 
 # 停训练（不关 Ray）/ 停 Ray
-bash scripts/train_component3_rl_cluster4.sh stop
+bash scripts/train/train_component3_rl_cluster4.sh stop
 bash scripts/ray/start_ray_head.sh stop
 ```
 
 配置：`configs/vampo_ppo_trainer_cluster4.yaml`（`nnodes=4`，`1×4=4` 条轨迹/step，`max_wm_steps=8`，`total_epochs=24576`，Megatron TP=4，VideoMAE reward）。
 
-单卡入口仍为 `train_component3_rl.sh`（`nnodes=1`）。
+单卡入口：`vamverl-train` / `vampo-train`（`nnodes=1`，`vampo_ppo_trainer.yaml`）。
 
 ## 代码位置
 

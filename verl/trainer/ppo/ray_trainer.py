@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import gc
 import os
 import statistics
 import time
@@ -169,9 +170,11 @@ def compute_advantage(data: DataProto, gamma, lam, adv_estimator, config):
         steps = torch.arange(response_length, device=data.batch['responses'].device)  # (traj_len,)
         steps_expanded = steps.unsqueeze(0).expand(data.batch['responses'].size(0), -1)
         response_mask = steps_expanded < finish_step.unsqueeze(1)  # (batch_size, traj_len)
-        if config.data.get("backend") == "vampo":
-            from vampo.integrations.verl.grpo_advantage import compute_vampo_grpo_outcome_advantage
-            advantages, returns = compute_vampo_grpo_outcome_advantage(
+        from verl.trainer.ppo.dreamzero_backend import is_dreamzero_backend
+
+        if is_dreamzero_backend(config):
+            from verl.trainer.ppo.dreamzero_grpo import compute_dreamzero_grpo_outcome_advantage
+            advantages, returns = compute_dreamzero_grpo_outcome_advantage(
                 token_level_rewards=token_level_rewards,
                 eos_mask=response_mask,
                 index=index,
@@ -304,13 +307,15 @@ class RayTrainer(object):
         from torch.utils.data import DataLoader
         from verl.utils.dataset.rob_dataset import collate_fn
 
+        from verl.trainer.ppo.dreamzero_backend import is_dreamzero_backend
+
         backend = self.config.data.get("backend", "wmpo")
-        if backend == "vampo":
-            from vampo.integrations.verl.dataset import VAMPOInitStateDataset
+        if is_dreamzero_backend(self.config):
+            from verl.utils.dataset.dreamzero_init_state import DreamZeroInitStateDataset
 
             init_dir = self.config.data.init_states_dir
             train_bs = int(self.config.data.train_batch_size * self.config.data.oversample_factor)
-            self.train_dataset = VAMPOInitStateDataset(init_dir)
+            self.train_dataset = DreamZeroInitStateDataset(init_dir)
             self.train_dataloader = BufferedDataLoader(
                 DataLoader(
                     dataset=self.train_dataset,
@@ -320,13 +325,13 @@ class RayTrainer(object):
                     collate_fn=collate_fn,
                 )
             )
-            self.val_dataset = VAMPOInitStateDataset(init_dir)
+            self.val_dataset = DreamZeroInitStateDataset(init_dir)
             self.val_dataloader = DataLoader(
                 dataset=self.val_dataset,
                 batch_size=self.config.data.val_batch_size,
                 collate_fn=collate_fn,
             )
-            self.rollout_dataset = VAMPOInitStateDataset(init_dir)
+            self.rollout_dataset = DreamZeroInitStateDataset(init_dir)
             self.rollout_dataloader = DataLoader(
                 dataset=self.rollout_dataset,
                 batch_size=self.config.data.rollout_batch_size,
@@ -559,6 +564,34 @@ class RayTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    def _maybe_pre_update_cooldown(self, global_steps: int) -> None:
+        """Pause before update_actor so GB10 unified memory can reclaim rollout peak."""
+        from verl.trainer.ppo.dreamzero_backend import is_dreamzero_backend
+
+        if not is_dreamzero_backend(self.config):
+            return
+        sec = float(
+            os.environ.get(
+                "VAMPO_PRE_UPDATE_COOLDOWN_SEC",
+                self.config.trainer.get("pre_update_cooldown_sec", 0) or 0,
+            )
+            or 0
+        )
+        if sec <= 0:
+            return
+        print(
+            f"pre-update unified-memory cooldown @ global_step {global_steps}: sleep {sec:.0f}s",
+            flush=True,
+        )
+        time.sleep(sec)
+        gc.collect()
+        try:
+            from verl.utils.debug.performance import trim_process_heap
+
+            trim_process_heap()
+        except ImportError:
+            pass
+
     def _maybe_epoch_cooldown(self, global_steps: int) -> None:
         """Optional pause between PPO steps (driver-side; workers idle until next rollout)."""
         every = int(
@@ -617,9 +650,11 @@ class RayTrainer(object):
         skip_first_wm_update = False
         skip_first_rm_update = False
         self.train_dataloader.start_new_epoch()
-        _vampo_progress = self.config.data.get("backend") == "vampo"
-        if _vampo_progress:
-            from vampo.integrations.verl.train_progress import (
+        from verl.trainer.ppo.dreamzero_backend import is_dreamzero_backend
+
+        _dreamzero_progress = is_dreamzero_backend(self.config)
+        if _dreamzero_progress:
+            from verl.trainer.ppo.dreamzero_progress import (
                 log_actor_update,
                 log_batch_rewards,
                 log_grpo_summary,
@@ -627,7 +662,7 @@ class RayTrainer(object):
             )
         for epoch in range(self.config.trainer.total_epochs):
             if True:
-                if _vampo_progress:
+                if _dreamzero_progress:
                     log_step_banner(global_step=global_steps, epoch=epoch, phase="rollout")
                 valid_batch = []
                 buffer_batch = []
@@ -647,7 +682,9 @@ class RayTrainer(object):
                         newbatch = self.train_dataloader.get_next_batch()
                         # newbatch = DataProto.from_single_dict({'dumpy': torch.zeros(self.config.data.train_batch_size)})
                         newbatch = DataProto.from_single_dict(newbatch)
-                        if self.config.data.get("backend") == "vampo":
+                        from verl.trainer.ppo.dreamzero_backend import is_dreamzero_backend
+
+                        if is_dreamzero_backend(self.config):
                             gen_batch = newbatch.select(batch_keys=["state_id", "init_index"], meta_info_keys={})
                         else:
                             gen_batch = newbatch.select(batch_keys=["states", "state_id"], meta_info_keys={})
@@ -727,7 +764,7 @@ class RayTrainer(object):
                 for k, v in reward_format_metrics.items():
                     metrics['train_verify_score_wo_format/' + k] = np.mean(metrics['train_verify_score_wo_format/' + k])
                 batch = valid_batch
-                if _vampo_progress:
+                if _dreamzero_progress:
                     log_batch_rewards(
                         batch,
                         global_step=global_steps,
@@ -759,7 +796,7 @@ class RayTrainer(object):
                     batch.batch['token_level_scores'] = reward_tensor_dict['all']
                     for k, v in reward_metrics.items():
                         metrics['train_reward/' + k] = v
-                    if _vampo_progress and reward_metrics:
+                    if _dreamzero_progress and reward_metrics:
                         parts = " ".join(f"{k}={v:.4f}" for k, v in reward_metrics.items())
                         print(f"VAMPO [token_reward] global_step={global_steps} {parts}", flush=True)
                     # decomposed rewards:
@@ -781,7 +818,7 @@ class RayTrainer(object):
                                               adv_estimator=self.config.algorithm.adv_estimator,
                                               config = self.config)
                 metrics['timing/adv'] = timer.last
-                if _vampo_progress:
+                if _dreamzero_progress:
                     log_grpo_summary(
                         batch,
                         global_step=global_steps,
@@ -793,8 +830,9 @@ class RayTrainer(object):
 
                 # implement critic warmup
                 if self.config.trainer.critic_warmup <= global_steps:
-                    if _vampo_progress:
+                    if _dreamzero_progress:
                         log_step_banner(global_step=global_steps, epoch=epoch, phase="update_actor")
+                    self._maybe_pre_update_cooldown(global_steps)
                     # update actor
                     with Timer(name='update_actor', text="{name}: {seconds:.1f} seconds") as timer:
                         batch.meta_info['is_filtered'] = True
@@ -806,7 +844,7 @@ class RayTrainer(object):
                     entropy_output_metrics = reduce_metrics(entropy_output.meta_info['metrics'])
                     metrics.update(actor_output_metrics)
                     metrics.update(entropy_output_metrics)
-                    if _vampo_progress:
+                    if _dreamzero_progress:
                         log_actor_update(
                             {**actor_output_metrics, **entropy_output_metrics,
                              "timing/update_actor": metrics['timing/update_actor']},
@@ -829,7 +867,7 @@ class RayTrainer(object):
                 with Timer(name='logging3', text="{name}: {seconds:.1f} seconds") as timer:
                     # TODO: make a canonical logger that supports various backend
                     logger.log(data=metrics, step=global_steps)
-                if _vampo_progress:
+                if _dreamzero_progress:
                     timing_keys = [k for k in sorted(metrics.keys()) if k.startswith("timing/")]
                     summary = " ".join(f"{k.split('/')[-1]}={metrics[k]:.1f}s" for k in timing_keys if isinstance(metrics[k], (int, float)))
                     print(f"VAMPO [step_done] global_step={global_steps} {summary}", flush=True)

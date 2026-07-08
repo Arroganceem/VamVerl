@@ -62,32 +62,32 @@ VideoMAE ckpt：`VIDEOMAE_CKPT=./checkpoints/videomae_droid.pth`
 |------|------|------|
 | 2 · VideoMAE 离线训 | `python -m vampo.reward.train_videomae` | `configs/videomae_droid.yaml` |
 | 3 · **verl GRPO + PPO** | **`vampo-train`** | **`vampo_ppo_trainer.yaml`** |
-| 3 · 四机 FSDP+LoRA | **`train_component3_rl_cluster4.sh`** | **`vampo_ppo_trainer_cluster4.yaml`** |
+| 3 · 四机 FSDP+LoRA | **`scripts/train/train_component3_rl_cluster4.sh`** | **`vampo_ppo_trainer_cluster4.yaml`** |
 
 ```bash
 export DROID_DATA_ROOT=/home/robotem/DATA/droid_lerobot
 export MODEL_PATH=/home/robotem/Models/DreamZero-DROID
 export VIDEOMAE_CKPT=/home/robotem/WAM/VamVerl/checkpoints/videomae_droid.pth
 
-bash scripts/build_init_states_from_droid.sh
+bash scripts/data/build_init_states_from_droid.sh
 vampo-train                                  # 单机 FSDP · n_samples=8
 # 或
-bash scripts/sync_vamverl_cluster.sh
-bash scripts/train_component3_rl_cluster4.sh   # 四机 FSDP+LoRA · n_samples=4
+bash scripts/cluster/sync_vamverl_cluster.sh
+bash scripts/train/train_component3_rl_cluster4.sh   # 四机 FSDP+LoRA · n_samples=4
 ```
 
 ## 训练前检查
 
 ```bash
 # 分阶段验证（推荐：无需完整训练 / 不加载 14B）
-bash scripts/verify_staged.sh              # Stage 0–3：代码 + RL mock 链路
-bash scripts/verify_staged.sh --through 4  # + VideoMAE CPU 冒烟
-bash scripts/verify_staged.sh --through 5  # 开训前 strict（等同 preflight --strict-reward）
+bash scripts/preflight/verify_staged.sh              # Stage 0–3：代码 + RL mock 链路
+bash scripts/preflight/verify_staged.sh --through 4  # + VideoMAE CPU 冒烟
+bash scripts/preflight/verify_staged.sh --through 5  # 开训前 strict（等同 preflight --strict-reward）
 pytest tests/test_staged_rl_pipeline.py -q
 
 # 传统 preflight
-bash scripts/preflight_rl.sh --skip-reward    # 数据 / init_states / 基座
-bash scripts/preflight_rl.sh --strict-reward  # 含 VideoMAE ckpt 冒烟
+bash scripts/preflight/preflight_rl.sh --skip-reward    # 数据 / init_states / 基座
+bash scripts/preflight/preflight_rl.sh --strict-reward  # 含 VideoMAE ckpt 冒烟
 ```
 
 详见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。
@@ -97,7 +97,7 @@ bash scripts/preflight_rl.sh --strict-reward  # 含 VideoMAE ckpt 冒烟
 | DreamZero 基座 | `MODEL_PATH` |
 | DROID 数据 | `DROID_DATA_ROOT` |
 | Episode 划分 | `data/splits/` |
-| init_states | `bash scripts/build_init_states_from_droid.sh` |
+| init_states | `bash scripts/data/build_init_states_from_droid.sh` |
 | VideoMAE ckpt | `VIDEOMAE_CKPT` / `checkpoints/videomae_droid.pth` |
 
 ## 配置 profile

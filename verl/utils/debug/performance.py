@@ -12,19 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from pathlib import Path
+
 import torch
 import torch.distributed as dist
-import logging
+
+
+def _process_rss_gb() -> float | None:
+    """Resident set size (GB). On GB10 unified memory this tracks the shared pool."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024**2
+    except OSError:
+        pass
+    return None
 
 
 def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0):
     if (not dist.is_initialized()) or (rank is None) or (dist.get_rank() == rank):
-        memory_allocated = torch.cuda.memory_allocated() / 1024**3
-        memory_reserved = torch.cuda.memory_reserved() / 1024**3
-
-        message = f'{head}, memory allocated (GB): {memory_allocated}, memory reserved (GB): {memory_reserved}'
+        parts = [head]
+        rss = _process_rss_gb()
+        if rss is not None:
+            parts.append(f"process RSS (GB): {rss:.2f}")
+        if torch.cuda.is_available():
+            parts.append(
+                f"cuda allocated/reserved (GB): "
+                f"{torch.cuda.memory_allocated() / 1024**3:.2f}/"
+                f"{torch.cuda.memory_reserved() / 1024**3:.2f}"
+            )
+        message = ", ".join(parts)
 
         if logger is None:
-            print(message)
+            print(message, flush=True)
         else:
             logger.log(msg=message, level=level)
+
+
+def trim_process_heap() -> None:
+    """Return freed heap pages to OS (helps GB10 unified memory reclaim after large peaks)."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass

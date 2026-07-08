@@ -327,9 +327,12 @@ class WANPolicyHead(ActionHead):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
 
-        from groot.vla.utils.distributed_load import fsdp_rank0_load_device, should_load_checkpoint_weights
+        from groot.vla.utils.distributed_load import (
+            fsdp_rank0_load_device,
+            should_load_local_component_weights,
+        )
         load_dev = fsdp_rank0_load_device()
-        if should_load_checkpoint_weights():
+        if should_load_local_component_weights():
             if load_dev == "cuda":
                 self.cuda()
                 print("rank0: action_head on CUDA before component weight load")
@@ -363,7 +366,7 @@ class WANPolicyHead(ActionHead):
             if load_dev == "cuda":
                 torch.cuda.empty_cache()
 
-        if not config.skip_component_loading and should_load_checkpoint_weights():
+        if not config.skip_component_loading and should_load_local_component_weights():
             dit_dir = self.model.diffusion_model_pretrained_path
             # Wan2.2 (in_dim=48) uses Wan2.2-TI2V-5B repo; Wan2.1 uses Wan2.1-I2V-14B-480P
             dit_repo_id = WAN22_HF_REPO_ID if getattr(self.model, "in_dim", 16) == 48 else WAN_HF_REPO_ID
@@ -383,7 +386,16 @@ class WANPolicyHead(ActionHead):
                 _load_dit_safetensors_into_model(self.model, dit_dir, device=load_dev)
                 print("Successfully loaded pretrained weights")
         elif not config.skip_component_loading:
-            print("Skipping Wan component disk load on rank > 0 (FSDP sync_module_states)")
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            from groot.vla.utils.distributed_load import use_fsdp_sharded_checkpoint
+
+            if use_fsdp_sharded_checkpoint():
+                print(
+                    f"Rank {rank}: skipping Wan component disk load (replicated.safetensors after meta init)",
+                    flush=True,
+                )
+            else:
+                print("Skipping Wan component disk load on rank > 0 (FSDP sync_module_states)")
         else:
             print("Skipping individual component loading (loading from full pretrained model)")
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
@@ -1552,6 +1564,9 @@ class WANPolicyHead(ActionHead):
         # Move models to the cuda device and set the dtype to bfloat16.
         print("Moving models to the cuda device and setting the dtype to bfloat16.")
         self.model.to(device=self._device, dtype=torch.bfloat16)
+        base_model = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        if hasattr(base_model, "post_initialize"):
+            base_model.post_initialize()
         self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
         self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
         self.vae.to(device=self._device, dtype=torch.bfloat16)

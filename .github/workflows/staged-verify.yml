@@ -23,7 +23,7 @@ jobs:
           pip install -e ".[dev,verl]"
 
       - name: Stage 0–3 (static + RL mock + config)
-        run: bash scripts/verify_staged.sh --through 3 --json
+        run: bash scripts/preflight/verify_staged.sh --through 3 --json
 
       - name: Unit tests (RL pipeline mock)
         run: pytest tests/test_staged_rl_pipeline.py -q

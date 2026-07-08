@@ -2,8 +2,8 @@
 # 四机 Ray 集群 · 仅负责 Ray 启停，不含 NFS 同步/训练
 #
 # 前置（41 上依次）:
-#   bash scripts/mount_nfs_cluster4.sh all
-#   bash scripts/sync_vamverl_cluster.sh
+#   bash scripts/cluster/mount_nfs_cluster4.sh all
+#   bash scripts/cluster/sync_vamverl_cluster.sh
 #
 # 用法（41 上）:
 #   bash scripts/ray/start_ray_head.sh              # 起四机 Ray
@@ -22,7 +22,7 @@ SRC_BIND="${SRC_BIND:-192.168.88.41}"
 REMOTE_USER="${REMOTE_USER:-robotem}"
 VAMVERL_ROOT="${VAMVERL_ROOT:-${HOME}/WAM/VamVerl}"
 RAY_PORT="${RAY_PORT:-6379}"
-RAY_OBJECT_STORE_BYTES="${RAY_OBJECT_STORE_BYTES:-8589934592}"
+RAY_OBJECT_STORE_BYTES="${RAY_OBJECT_STORE_BYTES:-4294967296}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=30 -o "BindAddress=${SRC_BIND}")
 # stop 用更短超时，避免 .21 hung 时整脚本卡死
 SSH_STOP_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=4 -o ServerAliveCountMax=2 -o "BindAddress=${SRC_BIND}")
@@ -219,7 +219,7 @@ cmd_cluster() {
   mkdir -p "${LOG_DIR}"
 
   [[ -x "${WORKER_SCRIPT}" ]] || {
-    echo "ERROR: 缺少 ${WORKER_SCRIPT}（先 bash scripts/mount_nfs_cluster4.sh vamverl）" >&2
+    echo "ERROR: 缺少 ${WORKER_SCRIPT}（先 bash scripts/cluster/mount_nfs_cluster4.sh vamverl）" >&2
     exit 1
   }
 
@@ -262,7 +262,7 @@ cmd_cluster() {
   echo ""
   echo ">>> 四机 Ray 就绪"
   echo "  Dashboard: http://${HEAD_IP}:8265"
-  echo "  开训: bash ${VAMVERL_ROOT}/scripts/train_component3_rl_cluster4.sh"
+  echo "  开训: bash ${VAMVERL_ROOT}/scripts/train/train_component3_rl_cluster4.sh"
   echo "  日志: ${HEAD_LOG}  及各机 ~/cluster-4spark-setup/vampo-ray-worker-nohup.log"
 }
 
@@ -274,7 +274,7 @@ usage() {
   bash scripts/ray/start_ray_head.sh status
   bash scripts/ray/start_ray_head.sh block     仅 head 前台
 
-前置: bash scripts/mount_nfs_cluster4.sh all && bash scripts/sync_vamverl_cluster.sh
+前置: bash scripts/cluster/mount_nfs_cluster4.sh all && bash scripts/cluster/sync_vamverl_cluster.sh
 EOF
 }
 

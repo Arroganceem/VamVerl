@@ -23,13 +23,13 @@
   ── 推荐执行顺序 ──
 
   [0] 训练或准备 VideoMAE ckpt（组件 2，与 rl_init disjoint）
-  [1] bash scripts/build_init_states_from_droid.sh
-  [2] bash scripts/train_component3_rl.sh  （或 train_component3_rl_cluster4.sh）
+  [1] bash scripts/data/build_init_states_from_droid.sh
+  [2] bash scripts/train/train_component3_rl_cluster4.sh
 ```
 
 ## 训练完整循环
 
-下图从 **数据准备** 到 **verl 每个 training step 的闭环**，对应 `train_component3_rl.sh`。
+下图从 **数据准备** 到 **verl 每个 training step 的闭环**，对应 `scripts/train/train_component3_rl_cluster4.sh`。
 
 **默认数值** 来自 `configs/vampo_ppo_trainer.yaml`。
 
@@ -55,7 +55,7 @@ DROID episodes
 ║  Phase 0 · 一次性准备（训练前）                                                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-  bash scripts/build_init_states_from_droid.sh   # rl_init pool only
+  bash scripts/data/build_init_states_from_droid.sh   # rl_init pool only
         │
         ▼
   init_states/  ·  rl_init episode 起点（默认 ≤2888 条，无 train 泄漏）
@@ -63,7 +63,7 @@ DROID episodes
 
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  Phase 1 · verl 主循环  train_component3_rl.sh                              ║
+║  Phase 1 · verl 主循环  train_component3_rl_cluster4.sh                     ║
 ║  每 global_step：train_batch_size × n_samples 条轨迹 → 1 次 PPO 更新         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 

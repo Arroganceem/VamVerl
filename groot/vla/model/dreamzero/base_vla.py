@@ -513,7 +513,9 @@ class VLA(PreTrainedModel):
         from groot.vla.utils.distributed_load import (
             fsdp_rank0_load_device,
             should_load_checkpoint_weights,
+            should_load_local_component_weights,
             use_fsdp_meta_init,
+            use_fsdp_sharded_checkpoint,
         )
         print("loading pretrained@@@@@")
         # Check for different checkpoint formats
@@ -538,10 +540,19 @@ class VLA(PreTrainedModel):
             config.action_head_cfg['defer_lora_injection'] = False
             print("config.action_head_cfg['defer_lora_injection'] disabled (set to False)")
 
-        # Rank0: materialize + load shards. Rank>0: meta→empty CPU (avoid 16B RAM / OOM on workers).
+        # FSDP: rank0 full load (legacy) OR all ranks meta→empty (per-rank sharded checkpoint).
         if use_fsdp_meta_init():
             rank = dist.get_rank()
-            print(f"Rank {rank}: meta init VLA (weights will sync via FSDP broadcast from rank0)")
+            if use_fsdp_sharded_checkpoint():
+                print(
+                    f"Rank {rank}: meta init VLA (per-rank FSDP sharded checkpoint, no rank0 full load)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Rank {rank}: meta init VLA (weights will sync via FSDP broadcast from rank0)",
+                    flush=True,
+                )
             try:
                 with torch.device("meta"):
                     model = cls(config)
@@ -553,7 +564,10 @@ class VLA(PreTrainedModel):
                 model.to_empty(device="cpu")
         else:
             model = cls(config)
-        print("model", model)
+        if should_load_checkpoint_weights():
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            n_params = sum(p.numel() for p in model.parameters())
+            print(f"Rank {rank}: VLA init OK ({n_params / 1e9:.2f}B params)", flush=True)
 
         def _load_shard_dict(shard_state_dict: dict) -> None:
             if any(".base_layer." in key for key in shard_state_dict.keys()):
@@ -584,6 +598,12 @@ class VLA(PreTrainedModel):
                 print(f"Loading weights from safetensors: {safetensors_path}")
                 _load_shard_dict(load_file(safetensors_path, device=load_dev))
             print("Successfully loaded pretrained weights")
+        elif use_fsdp_sharded_checkpoint():
+            print(
+                f"Rank {dist.get_rank() if dist.is_initialized() else 0}: "
+                "Skipping DreamZero full checkpoint (FSDP sharded load after wrap)",
+                flush=True,
+            )
         else:
             print("Skipping DreamZero checkpoint disk load on rank > 0 (FSDP sync_module_states)")
 

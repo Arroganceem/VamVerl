@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vampo"
-version = "0.2.0"
-description = "VAMPO: WMPO-style GRPO/PPO on video-action world models (VideoMAE reward + verl)"
+name = "vamverl"
+version = "0.3.0"
+description = "DreamZero GRPO/PPO on verl (VideoMAE reward + FSDP distributed RL)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -55,11 +55,11 @@ reward = [
 ]
 
 [project.scripts]
-vampo-train = "vampo.integrations.verl.main_vampo_ppo:main_hydra"
-vampo-train-videomae = "vampo.reward.train_videomae:main"
-vampo-bootstrap-init-states = "vampo.data.init_states_bootstrap:main"
-vampo-build-init-states = "vampo.data.droid_to_init_states:main"
+vamverl-train = "verl.trainer.main_dreamzero_ppo:main_hydra"
+vampo-train = "verl.trainer.main_dreamzero_ppo:main_hydra"
+verl-train-dreamzero = "verl.trainer.main_dreamzero_ppo:main_hydra"
+vampo-train-videomae = "verl.utils.reward.train_videomae:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vampo*", "verl*", "groot*", "eval_utils*"]
+include = ["verl*", "groot*", "eval_utils*"]

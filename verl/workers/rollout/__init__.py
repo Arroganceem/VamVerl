@@ -31,3 +31,10 @@ try:
     __all__.append("RobWMHFRollout")
 except ImportError:
     RobWMHFRollout = None  # type: ignore[misc, assignment]
+
+try:
+    from .dreamzero_rollout import DreamZeroRollout
+
+    __all__.append("DreamZeroRollout")
+except ImportError:
+    DreamZeroRollout = None  # type: ignore[misc, assignment]

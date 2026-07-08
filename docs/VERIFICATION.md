@@ -9,16 +9,16 @@ cd /home/robotem/WAM/VamVerl
 pip install -e ".[verl,vla,dev]"
 
 # GitHub / CI 默认：Stage 0–3（CPU，无大模型）
-bash scripts/verify_staged.sh
+bash scripts/preflight/verify_staged.sh
 
 # 含本地 DROID / init_states 检查
-bash scripts/verify_staged.sh --through 1
+bash scripts/preflight/verify_staged.sh --through 1
 
 # 含 VideoMAE CPU 推理（需 ckpt + backbone，仍不加载 DreamZero）
-bash scripts/verify_staged.sh --through 4
+bash scripts/preflight/verify_staged.sh --through 4
 
 # 开训前：等同 preflight --strict-reward
-bash scripts/verify_staged.sh --through 5
+bash scripts/preflight/verify_staged.sh --through 5
 
 # 单元测试（RL mock 链路）
 pytest tests/test_staged_rl_pipeline.py -q
@@ -62,7 +62,7 @@ Stage 5    ──►  开训前最后一道门（含 strict VideoMAE）
 ## JSON 输出（CI）
 
 ```bash
-bash scripts/verify_staged.sh --json | jq '.github_ready'
+bash scripts/preflight/verify_staged.sh --json | jq '.github_ready'
 ```
 
 ## 与 `preflight_rl.sh` 的关系
@@ -81,7 +81,7 @@ bash scripts/verify_staged.sh --json | jq '.github_ready'
 
 上传前建议：
 
-1. 运行 `bash scripts/verify_staged.sh` 与 `pytest tests/test_staged_rl_pipeline.py`
+1. 运行 `bash scripts/preflight/verify_staged.sh` 与 `pytest tests/test_staged_rl_pipeline.py`
 2. 确认 `.gitignore` 已排除 `checkpoints/*.pth`、`data/` 大文件、`wandb/`、`outputs/`
 3. 大权重通过 README 说明从外部路径 / ModelScope 获取，**不要提交进 git**
 4. 可选：推送后 GitHub Actions 跑 `.github/workflows/staged-verify.yml`
