@@ -36,10 +36,11 @@ actor_rollout_ref:
       sequential_block_wrap: true
       # 每 rank 只读 1/4 DiT；T5/VAE/projector 从 replicated.safetensors 各 rank 加载
       sharded_checkpoint_dir: ${oc.env:VAMVERL_FSDP_SHARDED_CHECKPOINT,/home/robotem/Models/DreamZero-DROID-fsdp4}
-      # GB10 为 CPU/GPU 共享统一内存池（非独立显存）；峰值 = DiT + KV + 激活 + VideoMAE + Adam
-      param_offload: false       # DiT FSDP 分片常驻；靠 grad/optimizer offload + 分阶段 flush
-      grad_offload: true         # 每个 micro-batch backward 后梯度落 CPU，避免与 rollout 峰值叠加
-      optimizer_offload: true    # Adam 仅在 optimizer.step 前上 GPU
+      # GB10 统一内存：CPU↔GPU 搬迁不腾物理池；只能阶段互斥 + flush/del 释放引用
+      # 峰值相位：rollout(KV+VideoMAE) 与 update(激活+Adam瞬时) 严禁重叠
+      param_offload: false       # 统一内存下 offload 参数几乎无收益（甚至更慢）
+      grad_offload: true         # backward 后尽快丢掉 grad 引用
+      optimizer_offload: true    # Adam 仅 step 前后短暂占用，step 前后强制 flush
       wrap_policy:
         transformer_layer_cls_to_wrap:
           - CausalWanAttentionBlock

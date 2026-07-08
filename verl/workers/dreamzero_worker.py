@@ -267,7 +267,7 @@ class DreamZeroActorRolloutRefWorker(Worker):
         self._flush_unified_memory("after release_inference_caches")
 
     def _flush_unified_memory(self, tag: str) -> None:
-        """GB10 unified memory pool: sync, gc, trim heap so rollout/update peaks do not stack."""
+        """GB10 unified memory: drop reclaimable pages in-place (CPU↔GPU move does not free the pool)."""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         gc.collect()
@@ -275,6 +275,19 @@ class DreamZeroActorRolloutRefWorker(Worker):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         log_gpu_memory_usage(tag, logger=logger)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def flush_memory_pool(self):
+        """Driver-callable barrier flush on every rank (pre-update / post-update)."""
+        self._offload_rollout_reward()
+        self._release_inference_caches()
+        self._offload_fsdp_grad_only()
+        if self._is_offload_optimizer and getattr(self, "actor_optimizer", None):
+            offload_fsdp_optimizer(self.actor_optimizer)
+        self._flush_unified_memory("flush_memory_pool")
+        if dist.is_initialized():
+            dist.barrier()
+        return True
 
     def _offload_fsdp_grad_only(self) -> None:
         if not self._is_offload_grad or self._is_offload_param:
@@ -384,6 +397,8 @@ class DreamZeroActorRolloutRefWorker(Worker):
             self._flush_unified_memory("after micro backward")
 
         def _before_optimizer_step() -> None:
+            # Unified memory: release activations before Adam state is briefly resident.
+            self._flush_unified_memory("before optimizer step")
             if self._is_offload_optimizer and getattr(self, "actor_optimizer", None):
                 load_fsdp_optimizer(self.actor_optimizer, self.device)
 
@@ -391,6 +406,7 @@ class DreamZeroActorRolloutRefWorker(Worker):
             if self._is_offload_optimizer and getattr(self, "actor_optimizer", None):
                 offload_fsdp_optimizer(self.actor_optimizer)
             self._offload_fsdp_grad_only()
+            self._flush_unified_memory("after optimizer step")
 
         metrics = self.actor.update_policy(
             data=data,
@@ -403,6 +419,12 @@ class DreamZeroActorRolloutRefWorker(Worker):
         metrics["actor/lr(1e-4)"] = lr * 1e4
         if self._is_offload_param:
             self._offload_fsdp_train_state()
+        # Analytic entropy folded here so driver need not call compute_entropy again (avoids a second peak).
+        try:
+            metrics.update(self.actor.compute_entropy(batch_data=data.to("cpu")))
+        except Exception as exc:
+            logger.warning("inline compute_entropy failed: %s", exc)
+        del data
         self._flush_unified_memory("After update_actor")
         if dist.is_initialized():
             dist.barrier()
@@ -411,9 +433,9 @@ class DreamZeroActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=_VAMPO_FSDP_COMPUTE_PROTO)
     def compute_entropy(self, data: DataProto):
+        """Analytic entropy only — keep on CPU; do not touch DiT / CUDA for unified-memory safety."""
         assert self._is_actor
-        data = data.to(self.device)
-        metrics = self.actor.compute_entropy(batch_data=data)
+        metrics = self.actor.compute_entropy(batch_data=data.to("cpu"))
         output = DataProto(meta_info={"metrics": metrics})
         return output.to("cpu")
 

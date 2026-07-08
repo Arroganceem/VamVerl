@@ -565,7 +565,11 @@ class RayTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _maybe_pre_update_cooldown(self, global_steps: int) -> None:
-        """Pause before update_actor so GB10 unified memory can reclaim rollout peak."""
+        """Reclaim rollout peak on GB10 unified memory before update_actor.
+
+        Driver-only sleep is insufficient: CUDA reserved pages live on workers.
+        Flush every rank first, then optionally sleep so the OS can trim.
+        """
         from verl.trainer.ppo.dreamzero_backend import is_dreamzero_backend
 
         if not is_dreamzero_backend(self.config):
@@ -577,6 +581,14 @@ class RayTrainer(object):
             )
             or 0
         )
+        # Always flush workers when dreamzero; sleep is optional extra reclaim time.
+        flush = getattr(self.actor_rollout_wg, "flush_memory_pool", None)
+        if callable(flush):
+            print(
+                f"pre-update unified-memory flush @ global_step {global_steps}",
+                flush=True,
+            )
+            flush()
         if sec <= 0:
             return
         print(
@@ -591,6 +603,8 @@ class RayTrainer(object):
             trim_process_heap()
         except ImportError:
             pass
+        if callable(flush):
+            flush()
 
     def _maybe_epoch_cooldown(self, global_steps: int) -> None:
         """Optional pause between PPO steps (driver-side; workers idle until next rollout)."""
@@ -833,17 +847,27 @@ class RayTrainer(object):
                     if _dreamzero_progress:
                         log_step_banner(global_step=global_steps, epoch=epoch, phase="update_actor")
                     self._maybe_pre_update_cooldown(global_steps)
-                    # update actor
+                    # update actor (entropy folded into update_actor metrics on dreamzero path)
                     with Timer(name='update_actor', text="{name}: {seconds:.1f} seconds") as timer:
                         batch.meta_info['is_filtered'] = True
                         batch.meta_info['train_mode'] = False
                         actor_output = self.actor_rollout_wg.update_actor(batch)
-                        entropy_output = self.actor_rollout_wg.compute_entropy(data=batch)
                     metrics['timing/update_actor'] = timer.last
                     actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                    entropy_output_metrics = reduce_metrics(entropy_output.meta_info['metrics'])
                     metrics.update(actor_output_metrics)
-                    metrics.update(entropy_output_metrics)
+                    # Separate remote compute_entropy only if update_actor did not return it
+                    # (avoids a second worker peak right after Adam on unified memory).
+                    if "actor/entropy" not in actor_output_metrics:
+                        flush = getattr(self.actor_rollout_wg, "flush_memory_pool", None)
+                        if callable(flush):
+                            flush()
+                        entropy_output = self.actor_rollout_wg.compute_entropy(data=batch)
+                        entropy_output_metrics = reduce_metrics(entropy_output.meta_info['metrics'])
+                        metrics.update(entropy_output_metrics)
+                    else:
+                        entropy_output_metrics = {
+                            k: v for k, v in actor_output_metrics.items() if k.startswith("actor/entropy")
+                        }
                     if _dreamzero_progress:
                         log_actor_update(
                             {**actor_output_metrics, **entropy_output_metrics,

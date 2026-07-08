@@ -119,19 +119,19 @@ class DreamZeroPPOActor(BasePPOActor):
         return torch.cat(log_probs_lst, dim=0).detach()
 
     def compute_entropy(self, batch_data: DataProto) -> Dict:
+        """Analytic entropy on CPU — no DiT forward; safe on GB10 unified memory."""
         batch = batch_data.select(batch_keys=["responses", "obs_features", "finish_step"]).batch
-        actions, traj_len = self._flat_actions(batch["responses"])
+        actions, traj_len = self._flat_actions(batch["responses"].detach().cpu())
+        finish = batch["finish_step"].detach().cpu()
         batch_size, action_flat = actions.shape[0], actions.shape[-1]
         ent = self.actor_module.flow_entropy_per_wm_step()
         entropy = torch.full(
             (batch_size, traj_len * action_flat),
             ent / max(action_flat, 1),
-            device=actions.device,
+            device="cpu",
             dtype=torch.float32,
         )
-        mask = self._response_mask(
-            batch["finish_step"], traj_len, action_flat, entropy.device
-        )
+        mask = self._response_mask(finish, traj_len, action_flat, entropy.device)
         return {"actor/entropy": (entropy * mask).sum() / mask.sum().clamp_min(1.0)}
 
     def update_policy(
