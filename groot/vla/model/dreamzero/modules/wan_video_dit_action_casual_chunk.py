@@ -1826,18 +1826,41 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         updated_kv_caches: list[torch.Tensor] = []
         for block_index, block in enumerate(self.blocks):
-            x, updated_kv_cache = block(
-                x=x,
-                e=e0,
-                freqs=freqs,
-                freqs_action=self.freqs_action,
-                freqs_state=self.freqs_state,
-                context=context,
-                action_register_length=action_register_length,
-                kv_cache=kv_cache[block_index],
-                current_start_frame=current_start_frame,
-            )
-            updated_kv_caches.append(updated_kv_cache)
+            kv_in = kv_cache[block_index]
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                def _block_forward(x_in, _block=block, _kv=kv_in):
+                    x_out, _ = _block(
+                        x=x_in,
+                        e=e0,
+                        freqs=freqs,
+                        freqs_action=self.freqs_action,
+                        freqs_state=self.freqs_state,
+                        context=context,
+                        action_register_length=action_register_length,
+                        kv_cache=_kv,
+                        current_start_frame=current_start_frame,
+                    )
+                    return x_out
+
+                x = torch.utils.checkpoint.checkpoint(
+                    _block_forward,
+                    x,
+                    use_reentrant=False,
+                )
+                updated_kv_caches.append(kv_in)
+            else:
+                x, updated_kv_cache = block(
+                    x=x,
+                    e=e0,
+                    freqs=freqs,
+                    freqs_action=self.freqs_action,
+                    freqs_state=self.freqs_state,
+                    context=context,
+                    action_register_length=action_register_length,
+                    kv_cache=kv_in,
+                    current_start_frame=current_start_frame,
+                )
+                updated_kv_caches.append(updated_kv_cache)
 
         if action is not None:
             action_noise_pred = x[:, seq_len: seq_len + action_length]

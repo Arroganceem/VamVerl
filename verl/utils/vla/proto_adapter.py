@@ -89,6 +89,7 @@ def trajectories_to_dataproto(
                             "action_eps": c.flow_eps,
                             "video_path": c.video_flow_path,
                             "video_eps": c.video_flow_eps,
+                            "flow_cond": c.flow_cond,
                             # legacy keys
                             "path": c.flow_path,
                             "eps": c.flow_eps,

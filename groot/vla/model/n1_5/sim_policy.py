@@ -851,6 +851,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 "video_flow_eps",
                 "flow_log_prob",
                 "action_flow_log_prob",
+                "flow_cond_cache",
             )
             if k in model_pred
         }

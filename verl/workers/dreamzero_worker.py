@@ -280,6 +280,9 @@ class DreamZeroActorRolloutRefWorker(Worker):
     def flush_memory_pool(self):
         """Driver-callable barrier flush on every rank (pre-update / post-update)."""
         self._offload_rollout_reward()
+        mod = getattr(self, "actor_module", None)
+        if isinstance(mod, DreamZeroPolicyModule):
+            mod.release_rollout_heavy_modules()
         self._release_inference_caches()
         self._offload_fsdp_grad_only()
         if self._is_offload_optimizer and getattr(self, "actor_optimizer", None):
@@ -299,6 +302,9 @@ class DreamZeroActorRolloutRefWorker(Worker):
     def _prepare_for_policy_update(self) -> None:
         self._offload_rollout_reward()
         self._release_inference_caches()
+        mod = getattr(self, "actor_module", None)
+        if isinstance(mod, DreamZeroPolicyModule):
+            mod.release_rollout_heavy_modules()
         self._offload_fsdp_grad_only()
         if dist.is_initialized():
             dist.barrier()
@@ -425,6 +431,9 @@ class DreamZeroActorRolloutRefWorker(Worker):
         except Exception as exc:
             logger.warning("inline compute_entropy failed: %s", exc)
         del data
+        mod = getattr(self, "actor_module", None)
+        if isinstance(mod, DreamZeroPolicyModule):
+            mod.ensure_rollout_heavy_modules()
         self._flush_unified_memory("After update_actor")
         if dist.is_initialized():
             dist.barrier()
@@ -442,6 +451,9 @@ class DreamZeroActorRolloutRefWorker(Worker):
     @register(dispatch_mode=_VAMPO_FSDP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
+        mod = getattr(self, "actor_module", None)
+        if isinstance(mod, DreamZeroPolicyModule):
+            mod.ensure_rollout_heavy_modules()
         prompts = prompts.to(self.device)
         recompute_log_prob = prompts.meta_info.get("recompute_log_prob", True)
 
@@ -454,31 +466,43 @@ class DreamZeroActorRolloutRefWorker(Worker):
         self._offload_rollout_reward()
 
         if self._is_actor and recompute_log_prob:
-            self._release_inference_caches()
-            output.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size
-            output.meta_info["temperature"] = self.config.rollout.temperature
-            output.meta_info["use_dynamic_bsz"] = bool(
-                getattr(self.config.rollout, "log_prob_use_dynamic_bsz", False)
-            )
-            old_log_probs = self.actor.compute_log_prob(data=output)
-            output.batch["old_log_probs"] = old_log_probs
-            apply_recomputed_log_prob_fields(output)
-            if dist.get_rank() == 0:
-                if log_probs_degenerate(
-                    output.batch.get("old_log_probs"),
-                    output.batch.get("rollout_log_prob_scalar"),
-                ):
-                    print(
-                        "DreamZero ERROR: actor.compute_log_prob degenerate; "
-                        "check flow_traces in rollout batch",
-                        flush=True,
-                    )
-                else:
+            has_trace_lp = output.batch.get("old_log_probs") is not None
+            if has_trace_lp and not log_probs_degenerate(
+                output.batch.get("old_log_probs"),
+                output.batch.get("rollout_log_prob_scalar"),
+            ):
+                if dist.get_rank() == 0:
                     log_rollout_log_prob_summary(
                         output.batch["rollout_log_probs"],
                         output.batch["rollout_log_prob_scalar"],
-                        phase="recomputed",
+                        phase="trace",
                     )
+            else:
+                self._release_inference_caches()
+                output.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size
+                output.meta_info["temperature"] = self.config.rollout.temperature
+                output.meta_info["use_dynamic_bsz"] = bool(
+                    getattr(self.config.rollout, "log_prob_use_dynamic_bsz", False)
+                )
+                old_log_probs = self.actor.compute_log_prob(data=output)
+                output.batch["old_log_probs"] = old_log_probs
+                apply_recomputed_log_prob_fields(output)
+                if dist.get_rank() == 0:
+                    if log_probs_degenerate(
+                        output.batch.get("old_log_probs"),
+                        output.batch.get("rollout_log_prob_scalar"),
+                    ):
+                        print(
+                            "DreamZero ERROR: actor.compute_log_prob degenerate; "
+                            "check flow_traces in rollout batch",
+                            flush=True,
+                        )
+                    else:
+                        log_rollout_log_prob_summary(
+                            output.batch["rollout_log_probs"],
+                            output.batch["rollout_log_prob_scalar"],
+                            phase="recomputed",
+                        )
 
         if dist.get_rank() == 0 and "complete" in output.batch:
             from verl.trainer.ppo.dreamzero_progress import log_batch_rewards
@@ -490,6 +514,9 @@ class DreamZeroActorRolloutRefWorker(Worker):
             )
             log_batch_rewards(output, phase="worker_rollout", n_samples=n_samples)
 
+        mod = getattr(self, "actor_module", None)
+        if isinstance(mod, DreamZeroPolicyModule):
+            mod.release_rollout_heavy_modules()
         self._release_inference_caches()
         self._offload_fsdp_grad_only()
         self._flush_unified_memory("After generate_sequences")

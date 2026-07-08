@@ -714,7 +714,7 @@ class RayTrainer(object):
                             'n_samples': n_samples,
                             'pad_token_id': self.tokenizer.pad_token_id,
                             'use_wm': self.config.actor_rollout_ref.wm.enable,
-                            'recompute_log_prob': True,
+                            'recompute_log_prob': False if is_dreamzero_backend(self.config) else True,
                             # 'rollout_base_dir': self.config.actor_rollout_ref.rollout_base_dir,
                             # 'save_to_hdfs': True,
                             # 'return_rollouts': True

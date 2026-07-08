@@ -32,6 +32,7 @@ class DreamZeroInProcessBackend(PolicyBackend):
             flow_eps=ae,
             video_flow_path=vp,
             video_flow_eps=ve,
+            flow_cond=trace.flow_cond,
             info={"backend": "vla_inprocess", "flow_log_prob": lp_val},
         )
 

@@ -27,6 +27,7 @@ class FlowJointTrace:
     action_eps: torch.Tensor  # [K, B, H, D]
     video_path: torch.Tensor  # [K+1, B, T, C, H, W]
     video_eps: torch.Tensor  # [K, B, T, C, H, W]
+    flow_cond: dict | None = None  # rollout encoder/KV cache for log_prob replay
 
     @staticmethod
     def _squeeze_batch(t: torch.Tensor) -> torch.Tensor:
@@ -50,6 +51,7 @@ class FlowJointTrace:
             action_eps=self._restore_batch_dim(self.action_eps),
             video_path=self._restore_batch_dim(self.video_path),
             video_eps=self._restore_batch_dim(self.video_eps),
+            flow_cond=self.flow_cond,
         )
 
     def to_numpy(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -79,12 +81,23 @@ class FlowJointTrace:
     @classmethod
     def from_dict(cls, data: dict) -> FlowJointTrace:
         if "video_path" in data and "video_eps" in data:
-            return cls.from_numpy(
+            trace = cls.from_numpy(
                 data["action_path"] if "action_path" in data else data["path"],
                 data["action_eps"] if "action_eps" in data else data["eps"],
                 data["video_path"],
                 data["video_eps"],
             )
+            fc = data.get("flow_cond")
+            if isinstance(fc, dict) and fc:
+                import numpy as np
+
+                trace.flow_cond = {
+                    k: (np.asarray(v).copy() if hasattr(v, "__array__") else v)
+                    for k, v in fc.items()
+                }
+            else:
+                trace.flow_cond = None
+            return trace
         raise ValueError("flow trace dict must include video_path and video_eps")
 
 
@@ -253,6 +266,18 @@ class DreamZeroPolicyModule(nn.Module):
     def reset_episode(self) -> None:
         self._clear_action_head_episode_state()
 
+    def release_rollout_heavy_modules(self) -> None:
+        """Drop T5/CLIP/VAE before update_actor peak (GB10 unified memory)."""
+        ah = self.groot.trained_model.action_head
+        if hasattr(ah, "release_frozen_components"):
+            ah.release_frozen_components()
+
+    def ensure_rollout_heavy_modules(self) -> None:
+        """Reload T5/CLIP/VAE before rollout if released for update_actor."""
+        ah = self.groot.trained_model.action_head
+        if hasattr(ah, "ensure_frozen_components"):
+            ah.ensure_frozen_components()
+
     def _clear_action_head_episode_state(self) -> None:
         """Release Wan KV / language caches (GB10 unified memory — drop before update_actor)."""
         self._video_buffer = []
@@ -308,8 +333,10 @@ class DreamZeroPolicyModule(nn.Module):
         return convert_rl_obs_to_vla_obs(obs, prompt)
 
     def _decode_video_chunk(self, video_pred: torch.Tensor) -> np.ndarray:
-        self._video_buffer.append(video_pred.detach())
         ah = self.groot.trained_model.action_head
+        if getattr(ah, "vae", None) is None:
+            return np.zeros((self.imagined_frames, 64, 64, 3), dtype=np.uint8)
+        self._video_buffer.append(video_pred.detach())
         try:
             latent = torch.cat(self._video_buffer, dim=2)
             frames = ah.vae.decode(
@@ -339,14 +366,32 @@ class DreamZeroPolicyModule(nn.Module):
             if flow_trace is None:
                 raise ValueError("log_prob mode requires flow_trace")
             trace = flow_trace.with_batch_dim()
-            return {
+            kwargs = {
                 "rl_mode": "log_prob",
                 "rl_action_path": trace.action_path.to(self.device),
                 "rl_action_eps": trace.action_eps.to(self.device),
                 "rl_video_path": trace.video_path.to(self.device),
                 "rl_video_eps": trace.video_eps.to(self.device),
             }
+            if trace.flow_cond:
+                kwargs["rl_flow_cond"] = trace.flow_cond
+            else:
+                print(
+                    "VAMPO WARNING: log_prob without flow_cond cache; "
+                    "falling back to full encoder/VAE path",
+                    flush=True,
+                )
+            return kwargs
         return {}
+
+    def _require_flow_cond_for_update(self, trace: FlowJointTrace) -> None:
+        """update_actor always releases T5/CLIP/VAE first; must reuse rollout flow_cond."""
+        if trace.flow_cond:
+            return
+        raise RuntimeError(
+            "VAMPO: update_actor requires flow_cond on each WM trace. "
+            "Rollout (rl_mode=trace) must pack flow_cond_cache after KV warmup."
+        )
 
     def _joint_log_prob_from_aux(self, flow_aux: dict[str, Any]) -> torch.Tensor:
         if "flow_log_prob" in flow_aux:
@@ -366,6 +411,12 @@ class DreamZeroPolicyModule(nn.Module):
         rl_mode: str | None = None,
         flow_trace: FlowJointTrace | None = None,
     ) -> tuple[torch.Tensor, np.ndarray, dict[str, Any]]:
+        if rl_mode == "log_prob" and (
+            flow_trace is None or not getattr(flow_trace, "flow_cond", None)
+        ):
+            # Encoders are released before update_actor; only non-grad recompute may reload.
+            if not enable_grad:
+                self.ensure_rollout_heavy_modules()
         batch = Batch(obs=self._prepare_obs(obs, prompt))
         grad_ctx = torch.enable_grad() if enable_grad else torch.inference_mode()
         autocast_ctx = (
@@ -394,11 +445,19 @@ class DreamZeroPolicyModule(nn.Module):
         video_path = FlowJointTrace._squeeze_batch(flow_aux["video_flow_path"])
         video_eps = FlowJointTrace._squeeze_batch(flow_aux["video_flow_eps"])
         self._video_latent_numel = int(video_path[0].numel())
+        flow_cond = flow_aux.get("flow_cond_cache")
+        if not isinstance(flow_cond, dict) or not flow_cond:
+            print(
+                "VAMPO WARNING: trace rollout missing flow_cond_cache "
+                "(update_actor will fail without encoder reuse cache)",
+                flush=True,
+            )
         return FlowJointTrace(
             action_path=action_path,
             action_eps=action_eps,
             video_path=video_path,
             video_eps=video_eps,
+            flow_cond=dict(flow_cond) if isinstance(flow_cond, dict) else None,
         )
 
     @torch.no_grad()
@@ -408,6 +467,11 @@ class DreamZeroPolicyModule(nn.Module):
         """Rollout sampling; stores flow trace and per-WM log π from trace mode forward."""
         mean, video, flow_aux = self.forward_vla(obs, prompt, enable_grad=False, rl_mode="trace")
         trace = self._trace_from_aux(flow_aux)
+        if not trace.flow_cond:
+            raise RuntimeError(
+                "VAMPO: rollout trace missing flow_cond_cache. "
+                "Check KV warmup ran (current_start_frame>=1) and flow_cond packing."
+            )
         action = mean.reshape(self.action_horizon, self.action_dim).cpu().numpy().astype(np.float32)
         flow_lp = self._joint_log_prob_from_aux(flow_aux).float().detach()
         return action, video, flow_lp, trace
@@ -421,6 +485,8 @@ class DreamZeroPolicyModule(nn.Module):
         enable_grad: bool,
     ) -> torch.Tensor:
         """log π from stored path/ε; DiT re-forward only when grad is needed."""
+        if enable_grad:
+            self._require_flow_cond_for_update(trace)
         if not enable_grad:
             trace_lp = self._log_prob_from_trace(trace)
             if self._trace_log_prob_valid(trace_lp):
@@ -490,6 +556,8 @@ class DreamZeroPolicyModule(nn.Module):
                 raise TypeError(f"Unsupported flow trace type: {type(raw)}")
             lp = self._chain_log_prob(step_obs_list[t], prompt, ft, enable_grad=enable_grad)
             row_steps.append(lp)
+            if enable_grad and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         self._clear_action_head_episode_state()
         return torch.stack(row_steps)
 

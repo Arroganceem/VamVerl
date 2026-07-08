@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass, field
 import gc
 import logging
@@ -73,6 +74,88 @@ def _flow_rl_recompute_log_prob_from_trace(
     if not math.isfinite(val):
         return torch.tensor(float("nan"), device=device, dtype=torch.float32)
     return torch.tensor(val, device=device, dtype=torch.float32)
+
+
+_FLOW_COND_CACHE_VERSION = 1
+# encode_image: ys = concat([msk(4ch), vae_latent], dim=1); new_image = vae_latent[:, :, 0:1] only.
+_YS_MASK_CHANNELS = 4
+
+
+def _first_frame_latent_from_ys(ys: torch.Tensor) -> torch.Tensor:
+    """First-frame VAE latent for KV warmup noisy_input (not mask+latent ys[:, :, 0:1])."""
+    if ys.shape[1] <= _YS_MASK_CHANNELS:
+        raise ValueError(
+            f"flow_cond ys has {ys.shape[1]} channels; expected > {_YS_MASK_CHANNELS} "
+            "(mask + latent)"
+        )
+    return ys[:, _YS_MASK_CHANNELS:, 0:1]
+
+
+def _tensor_list_to_numpy(tensors: list[torch.Tensor]) -> list:
+    import numpy as np
+
+    return [t.detach().float().cpu().numpy() for t in tensors]
+
+
+def _pack_flow_cond_cache(
+    *,
+    prompt_embs: list[torch.Tensor],
+    clip_feas: torch.Tensor,
+    ys: torch.Tensor,
+    current_start_frame: int,
+    batch_size: int,
+    frame_seqlen: int,
+    seq_len: int,
+) -> dict:
+    """Encoder outputs only — KV cache omitted (multi-GB; Ray spill + GPU reload worsens OOM)."""
+    import numpy as np
+
+    return {
+        "version": _FLOW_COND_CACHE_VERSION,
+        "prompt_embs": [
+            np.ascontiguousarray(a) for a in _tensor_list_to_numpy(prompt_embs)
+        ],
+        "clip_feas": np.ascontiguousarray(clip_feas.detach().float().cpu().numpy()),
+        "ys": np.ascontiguousarray(ys.detach().float().cpu().numpy()),
+        "current_start_frame": int(current_start_frame),
+        "batch_size": int(batch_size),
+        "frame_seqlen": int(frame_seqlen),
+        "seq_len": int(seq_len),
+    }
+
+
+def _unpack_flow_cond_cache(
+    cache: dict,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    if not cache or int(cache.get("version", 0)) != _FLOW_COND_CACHE_VERSION:
+        raise ValueError("invalid or missing flow_cond cache")
+    import numpy as np
+
+    def _to_tensor(arr: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(np.ascontiguousarray(arr.copy()), device=device, dtype=dtype)
+
+    prompt_embs = [_to_tensor(a) for a in cache["prompt_embs"]]
+    clip_feas = _to_tensor(cache["clip_feas"])
+    ys = _to_tensor(cache["ys"])
+    warmup_image = _first_frame_latent_from_ys(ys)
+    # KV caches intentionally not stored — update reruns KV warmup (cheap vs encoders).
+    kv_tuple = None
+    if cache.get("kv_cache1"):
+        # Legacy batches with KV in flow_cond: ignore KV, fall back to warmup path.
+        kv_tuple = None
+    return (
+        prompt_embs,
+        clip_feas,
+        ys,
+        warmup_image,
+        kv_tuple,
+        int(cache["current_start_frame"]),
+        int(cache["batch_size"]),
+        int(cache["frame_seqlen"]),
+        int(cache["seq_len"]),
+    )
 
 
 def hf_download(filename: str, repo_id: str = WAN_HF_REPO_ID) -> str:
@@ -507,21 +590,29 @@ class WANPolicyHead(ActionHead):
         self.vae.requires_grad_(False)
         self.print_trainable_params()
 
-    def set_frozen_modules_to_eval_mode(self):
+    def set_frozen_modules_to_eval_mode(self, *, skip_encoders: bool = False) -> None:
         """
         Huggingface will call model.train() at each training_step. To ensure
         the expected behaviors for modules like dropout, batchnorm, etc., we
         need to call model.eval() for the frozen modules.
+        skip_encoders: True when T5/CLIP/VAE were released (flow_cond reuse on update).
         """
         if self.training:
             if not self.tune_diffusion_model:
                 self.model.eval()
-            self.text_encoder.eval()
-            self.image_encoder.eval()
-            self.vae.eval()
+            if skip_encoders:
+                return
+            if self.text_encoder is not None:
+                self.text_encoder.eval()
+            if self.image_encoder is not None:
+                self.image_encoder.eval()
+            if self.vae is not None:
+                self.vae.eval()
     
     
     def enable_vram_management(self, num_persistent_param_in_dit=None):
+        if self.text_encoder is None:
+            raise RuntimeError("text_encoder is None; cannot enable_vram_management")
         dtype = next(iter(self.text_encoder.parameters())).dtype
         enable_vram_management(
             self.text_encoder,
@@ -636,6 +727,10 @@ class WANPolicyHead(ActionHead):
         return image
 
     def encode_prompt(self, input_ids, attention_mask):
+        if self.text_encoder is None:
+            raise RuntimeError(
+                "text_encoder is None; call ensure_frozen_components() before encode_prompt"
+            )
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
         prompt_emb = self.text_encoder(input_ids, attention_mask)
         prompt_emb = prompt_emb.clone().to(dtype=torch.bfloat16)
@@ -645,6 +740,10 @@ class WANPolicyHead(ActionHead):
 
     def _ensure_vae_on_device(self, ref_tensor):
         """Lazily move the VAE to the correct device/dtype on first use."""
+        if self.vae is None:
+            raise RuntimeError(
+                "vae is None; call ensure_frozen_components() before VAE encode"
+            )
         if not getattr(self, '_vae_device_ready', False):
             self.vae.to(device=ref_tensor.device, dtype=torch.bfloat16)
             self.vae.eval()
@@ -657,6 +756,10 @@ class WANPolicyHead(ActionHead):
         return latents
 
     def encode_image(self, image, num_frames, height, width):
+        if self.image_encoder is None or self.vae is None:
+            raise RuntimeError(
+                "image_encoder/vae is None; call ensure_frozen_components() before encode_image"
+            )
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
             clip_context = self.image_encoder.encode_image(image)
@@ -679,6 +782,96 @@ class WANPolicyHead(ActionHead):
     def prepare_extra_input(self, latents=None):
         return {}
 
+    def release_frozen_components(self) -> None:
+        """Drop T5/CLIP/VAE refs between rollout and update_actor (GB10 unified memory)."""
+        released = False
+        for attr in ("text_encoder", "image_encoder", "vae"):
+            mod = getattr(self, attr, None)
+            if mod is not None:
+                try:
+                    mod.cpu()
+                except Exception:
+                    pass
+                del mod
+                setattr(self, attr, None)
+                released = True
+        if released:
+            self._vae_device_ready = False
+            self.clip_feas = None
+            self.ys = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def ensure_frozen_components(self) -> None:
+        """Re-instantiate T5/CLIP/VAE after release, before the next rollout encode path."""
+        if (
+            self.text_encoder is not None
+            and self.image_encoder is not None
+            and self.vae is not None
+        ):
+            return
+        if self.text_encoder is None:
+            self.text_encoder = instantiate(self.config.text_encoder_cfg)
+        if self.image_encoder is None:
+            self.image_encoder = instantiate(self.config.image_encoder_cfg)
+        if self.vae is None:
+            self.vae = instantiate(self.config.vae_cfg)
+        self._load_frozen_component_weights_from_disk()
+        self.text_encoder.requires_grad_(False)
+        self.image_encoder.requires_grad_(False)
+        self.vae.requires_grad_(False)
+
+    def _load_frozen_component_weights_from_disk(self) -> None:
+        from groot.vla.utils.distributed_load import (
+            fsdp_rank0_load_device,
+            should_load_local_component_weights,
+        )
+
+        if not should_load_local_component_weights():
+            return
+        load_dev = fsdp_rank0_load_device()
+        if self.text_encoder is not None:
+            text_enc_path = ensure_file(
+                self.text_encoder.text_encoder_pretrained_path,
+                "models_t5_umt5-xxl-enc-bf16.pth",
+            )
+            self.text_encoder.load_state_dict(
+                torch.load(text_enc_path, map_location=load_dev, weights_only=True)
+            )
+            if load_dev == "cuda":
+                self.text_encoder.cuda()
+        if self.image_encoder is not None:
+            img_enc_path = ensure_file(
+                self.image_encoder.image_encoder_pretrained_path,
+                "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            )
+            self.image_encoder.model.load_state_dict(
+                torch.load(img_enc_path, map_location=load_dev, weights_only=True),
+                strict=False,
+            )
+            if load_dev == "cuda":
+                self.image_encoder.cuda()
+        if self.vae is not None:
+            vae_hf_filename = (
+                "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
+            )
+            vae_repo_id = (
+                WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
+            )
+            vae_path = ensure_file(
+                self.vae.vae_pretrained_path,
+                vae_hf_filename,
+                repo_id=vae_repo_id,
+            )
+            self.vae.model.load_state_dict(
+                torch.load(vae_path, map_location=load_dev, weights_only=True)
+            )
+            if load_dev == "cuda":
+                self.vae.cuda()
+        if load_dev == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming") -> nn.Module:
         # Add LoRA to UNet
         self.lora_alpha = lora_alpha
@@ -698,6 +891,7 @@ class WANPolicyHead(ActionHead):
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
+        self.ensure_frozen_components()
         self.set_frozen_modules_to_eval_mode()
 
         data = action_input 
@@ -1077,6 +1271,7 @@ class WANPolicyHead(ActionHead):
         rl_action_eps: torch.Tensor | None = None,
         rl_video_path: torch.Tensor | None = None,
         rl_video_eps: torch.Tensor | None = None,
+        rl_flow_cond: dict | None = None,
     ) -> BatchFeature:
         start_time = time.perf_counter()
 
@@ -1092,121 +1287,152 @@ class WANPolicyHead(ActionHead):
         start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
         end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
 
-        self.set_frozen_modules_to_eval_mode()
-        data = action_input 
-        
-        videos = data["images"]
+        flow_cond_cache_out: dict | None = None
+        reuse_flow_cond = rl_mode == "log_prob" and rl_flow_cond is not None
+        self.set_frozen_modules_to_eval_mode(skip_encoders=reuse_flow_cond)
+        data = action_input
 
         embodiment_id = action_input.embodiment_id
-        state_features = action_input.state
+        state_features = action_input.state.to(dtype=torch.bfloat16)
 
-        videos = rearrange(videos, "b t h w c -> b c t h w")
+        skip_kv_warmup = False
+        prompt_embs: list[torch.Tensor]
+        image: torch.Tensor
 
-        if videos.dtype == torch.uint8:
-            videos = videos.float() / 255.0
-            videos = videos.to(dtype=self.dtype)
-            b, c, t, h, w = videos.shape
-            videos = videos.permute(0, 2, 1, 3, 4)  # [b, t, c, h, w]
-            videos = videos.reshape(b * t, c, h, w)
-            videos = self.normalize_video(videos)
-            videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)  # back to [b, c, t, h, w]
-            assert videos.min() >= -1.0 and videos.max() <= 1.0, "videos must be in [-1,1] range"
-            videos = videos.to(dtype=self.dtype)
-
-        state_features = state_features.to(dtype=torch.bfloat16)
-        videos = videos.to(dtype=torch.bfloat16)
-
-        # Wan 5B: same as training — resize to target resolution so latent matches DiT
-        target_h = getattr(self.config, "target_video_height", None)
-        target_w = getattr(self.config, "target_video_width", None)
-        if target_h is None or target_w is None:
-            if getattr(self.model, "frame_seqlen", None) in (50, 55):
-                target_h, target_w = 176, 320
-            else:
-                target_h, target_w = None, None
-        if target_h is not None and target_w is not None:
-            _, _, _, h, w = videos.shape
-            if (h, w) != (target_h, target_w):
-                b, c, t, _, _ = videos.shape
-                videos = torch.nn.functional.interpolate(
-                    videos.reshape(b * t, c, h, w),
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(b, c, t, target_h, target_w)
-
-        if self.language is None:
-            print("language is None, reset current_start_frame to 0")
+        if reuse_flow_cond:
+            device = torch.device(self._device)
+            (
+                prompt_embs,
+                clip_feas,
+                ys,
+                image,
+                _kv_ignored,
+                _cached_start_frame,
+                batch_size_cached,
+                frame_seqlen_cached,
+                seq_len_cached,
+            ) = _unpack_flow_cond_cache(rl_flow_cond, device)
+            self.clip_feas = clip_feas
+            self.ys = ys
+            # encode_image new_image = vae_latent[:, :, 0:1]; ys[:, :, 0:1] includes 4ch mask → 40ch DiT bug.
+            image = _first_frame_latent_from_ys(ys)
             self.language = data["text"]
             self.current_start_frame = 0
-        elif not torch.equal(self.language, data["text"]):
-            print("language changed, reset current_start_frame to 0")
-            self.current_start_frame = 0
-            self.language = data["text"]
-        elif videos.shape[2] == 1:
-            print("videos.shape[2] == 1, reset current_start_frame to 0")
-            self.current_start_frame = 0
-        elif self.current_start_frame >= self.model.local_attn_size:
-            print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
-            self.current_start_frame = 0
-
-        if self.ip_rank == 0:
-            print("videos shape", videos.shape, self.num_frames)
-
-        start_text_encoder_event.record()
-
-        text_inputs = self._prepare_text_inputs(data)
-        prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
-
-        end_text_encoder_event.record()
-        
-        start_image_encoder_event.record()
-
-        _, _, num_frames, height, width = videos.shape
-        if videos.shape[2] == 4 or videos.shape[2] == 9:
-            # special case for real-world eval where language is updated
-            image = videos[:, :, -1:].transpose(1, 2)
-        else:
-            image = videos[:, :, :1].transpose(1, 2)
-
-        if self.current_start_frame == 0:
-            clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
-            self.clip_feas = clip_feas.to(dtype=image.dtype)
-            self.ys = ys.to(dtype=image.dtype)
-        
-        assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
-
-        end_image_encoder_event.record()
-
-        start_vae_event.record()
-
-        if latent_video is not None and self.current_start_frame != 0:
-            image = latent_video
+            skip_kv_warmup = False
             if self.ip_rank == 0:
-                print("image shape@@", image.shape)
-        elif self.current_start_frame != 0:
-            # this is for real world execution
-            if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
-                print("no further action")
-            elif videos.shape[2] // 4 != self.num_frame_per_block:
-                # Repeating videos along dim 2.
-                repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-            
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-            else: 
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-           
-            image = self.vae.encode(
-                videos,
-                tiled=self.tiled,
-                tile_size=(self.tile_size_height, self.tile_size_width),
-                tile_stride=(self.tile_stride_height, self.tile_stride_width),
-            )
+                print(
+                    "VAMPO: log_prob reuse rollout flow_cond (skip encoder/VAE; KV warmup only)",
+                    flush=True,
+                )
+        else:
+            self.ensure_frozen_components()
+            videos = data["images"]
+            videos = rearrange(videos, "b t h w c -> b c t h w")
 
-        end_vae_event.record()
+            if videos.dtype == torch.uint8:
+                videos = videos.float() / 255.0
+                videos = videos.to(dtype=self.dtype)
+                b, c, t, h, w = videos.shape
+                videos = videos.permute(0, 2, 1, 3, 4)  # [b, t, c, h, w]
+                videos = videos.reshape(b * t, c, h, w)
+                videos = self.normalize_video(videos)
+                videos = videos.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)  # back to [b, c, t, h, w]
+                assert videos.min() >= -1.0 and videos.max() <= 1.0, "videos must be in [-1,1] range"
+                videos = videos.to(dtype=self.dtype)
+
+            videos = videos.to(dtype=torch.bfloat16)
+
+            # Wan 5B: same as training — resize to target resolution so latent matches DiT
+            target_h = getattr(self.config, "target_video_height", None)
+            target_w = getattr(self.config, "target_video_width", None)
+            if target_h is None or target_w is None:
+                if getattr(self.model, "frame_seqlen", None) in (50, 55):
+                    target_h, target_w = 176, 320
+                else:
+                    target_h, target_w = None, None
+            if target_h is not None and target_w is not None:
+                _, _, _, h, w = videos.shape
+                if (h, w) != (target_h, target_w):
+                    b, c, t, _, _ = videos.shape
+                    videos = torch.nn.functional.interpolate(
+                        videos.reshape(b * t, c, h, w),
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).reshape(b, c, t, target_h, target_w)
+
+            if self.language is None:
+                print("language is None, reset current_start_frame to 0")
+                self.language = data["text"]
+                self.current_start_frame = 0
+            elif not torch.equal(self.language, data["text"]):
+                print("language changed, reset current_start_frame to 0")
+                self.current_start_frame = 0
+                self.language = data["text"]
+            elif videos.shape[2] == 1:
+                print("videos.shape[2] == 1, reset current_start_frame to 0")
+                self.current_start_frame = 0
+            elif self.current_start_frame >= self.model.local_attn_size:
+                print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
+                self.current_start_frame = 0
+
+            if self.ip_rank == 0:
+                print("videos shape", videos.shape, self.num_frames)
+
+            start_text_encoder_event.record()
+
+            text_inputs = self._prepare_text_inputs(data)
+            prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
+
+            end_text_encoder_event.record()
+
+            start_image_encoder_event.record()
+
+            _, _, num_frames, height, width = videos.shape
+            if videos.shape[2] == 4 or videos.shape[2] == 9:
+                # special case for real-world eval where language is updated
+                image = videos[:, :, -1:].transpose(1, 2)
+            else:
+                image = videos[:, :, :1].transpose(1, 2)
+
+            if self.current_start_frame == 0:
+                clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
+                self.clip_feas = clip_feas.to(dtype=image.dtype)
+                self.ys = ys.to(dtype=image.dtype)
+
+            assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
+
+            end_image_encoder_event.record()
+
+            start_vae_event.record()
+
+            if latent_video is not None and self.current_start_frame != 0:
+                image = latent_video
+                if self.ip_rank == 0:
+                    print("image shape@@", image.shape)
+            elif self.current_start_frame != 0:
+                # this is for real world execution
+                if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
+                    print("no further action")
+                elif videos.shape[2] // 4 != self.num_frame_per_block:
+                    # Repeating videos along dim 2.
+                    repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
+                    videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
+
+                    first_frame = videos[:, :, 0:1]  # Extract first frame
+                    videos = torch.cat([first_frame, videos], dim=2)
+                else:
+                    first_frame = videos[:, :, 0:1]  # Extract first frame
+                    videos = torch.cat([first_frame, videos], dim=2)
+
+                image = self.vae.encode(
+                    videos,
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
+
+            end_vae_event.record()
 
         trace_action_path: list[torch.Tensor] = []
         trace_action_eps: list[torch.Tensor] = []
@@ -1238,100 +1464,146 @@ class WANPolicyHead(ActionHead):
             flow_log_prob_total = torch.zeros((), device=image.device, dtype=torch.float32)
             flow_log_prob_total = flow_log_prob_total + _flow_rl_standard_normal_log_prob(noise_action)
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
-        batch_size, num_channels, num_frames, height, width = noise_obs.shape
-        ######### Generate video #########
-        # DiT patch_embedding uses stride (1,2,2), so tokens per frame = (H//2)*(W//2)
-        tokens_per_frame = (height // 2) * (width // 2)
-        frame_seqlen = tokens_per_frame
-        seq_len = num_frames * frame_seqlen
+        if reuse_flow_cond:
+            noise_obs = rl_video_path[0].to(device=image.device, dtype=torch.bfloat16)
+            batch_size = int(batch_size_cached)
+            num_frames = noise_obs.shape[1]
+            num_channels = noise_obs.shape[2]
+            height = noise_obs.shape[3]
+            width = noise_obs.shape[4]
+            frame_seqlen = int(frame_seqlen_cached)
+            seq_len = int(seq_len_cached)
+        else:
+            noise_obs = self.generate_noise(
+                (image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]),
+                seed=self.seed,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            batch_size, num_channels, num_frames, height, width = noise_obs.shape
+            tokens_per_frame = (height // 2) * (width // 2)
+            frame_seqlen = tokens_per_frame
+            seq_len = num_frames * frame_seqlen
 
         image = image.transpose(1, 2)
-        noise_obs = noise_obs.transpose(1, 2)
+        if not reuse_flow_cond:
+            noise_obs = noise_obs.transpose(1, 2)
         if rl_mode == "log_prob":
-            noise_obs = rl_video_path[0].to(device=noise_obs.device, dtype=noise_obs.dtype)
+            if not reuse_flow_cond:
+                noise_obs = rl_video_path[0].to(device=noise_obs.device, dtype=noise_obs.dtype)
             flow_log_prob_total = flow_log_prob_total + _flow_rl_standard_normal_log_prob(noise_obs)
         elif rl_mode == "trace":
             trace_video_path.append(noise_obs.detach().float().cpu())
             flow_log_prob_total = flow_log_prob_total + _flow_rl_standard_normal_log_prob(noise_obs)
 
-        if self.current_start_frame == 0:
-            # Reinitialize KV cache and crossattn cache for each new sequence.
-            self.kv_cache1, self.kv_cache_neg = self._create_kv_caches(
-                batch_size=batch_size,
-                dtype=noise_obs.dtype,
-                device=noise_obs.device,
-                frame_seqlen=frame_seqlen,
+        if not skip_kv_warmup:
+            if self.current_start_frame == 0:
+                # Reinitialize KV cache and crossattn cache for each new sequence.
+                self.kv_cache1, self.kv_cache_neg = self._create_kv_caches(
+                    batch_size=batch_size,
+                    dtype=noise_obs.dtype,
+                    device=noise_obs.device,
+                    frame_seqlen=frame_seqlen,
+                )
+                self.crossattn_cache, self.crossattn_cache_neg = self._create_crossattn_caches(
+                    batch_size=batch_size,
+                    dtype=noise_obs.dtype,
+                    device=noise_obs.device,
+                )
+
+            assert self.kv_cache1 is not None
+            assert self.kv_cache_neg is not None
+            assert self.crossattn_cache is not None
+            assert self.crossattn_cache_neg is not None
+            kv_caches = self._get_caches(
+                [self.kv_cache1, self.kv_cache_neg],
             )
-            self.crossattn_cache, self.crossattn_cache_neg = self._create_crossattn_caches(
-                batch_size=batch_size,
-                dtype=noise_obs.dtype,
-                device=noise_obs.device,
-            )
-
-        assert self.kv_cache1 is not None
-        assert self.kv_cache_neg is not None
-        assert self.crossattn_cache is not None
-        assert self.crossattn_cache_neg is not None
-        kv_caches = self._get_caches(
-            [self.kv_cache1, self.kv_cache_neg],
-        )
-        crossattn_caches = self._get_caches(
-            [self.crossattn_cache, self.crossattn_cache_neg],
-        )
-
-        start_kv_event.record()
-
-        if self.current_start_frame == 0:
-            timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
-            self._run_diffusion_steps(
-                noisy_input=image.transpose(1, 2),
-                timestep=timestep * 0,
-                action=None,
-                timestep_action=None,
-                state=None,
-                embodiment_id=None,
-                context=prompt_embs,
-                seq_len=frame_seqlen,
-                y=self.ys[:, :, 0:1],
-                clip_feature=self.clip_feas,
-                kv_caches=kv_caches,
-                crossattn_caches=crossattn_caches,
-                kv_cache_metadata=dict(
-                    start_frame=0,
-                    update_kv_cache=True,
-                ),
-            )
-            self.current_start_frame += 1
-            
-        timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
-
-        if self.current_start_frame != 1:
-            current_ref_latents = image[:, -self.num_frame_per_block:]
-            if self.current_start_frame <= self.ys.shape[2]:
-                y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
-            else:
-                y = self.ys[:, :, -self.num_frame_per_block:]
-            self._run_diffusion_steps(
-                noisy_input=current_ref_latents.transpose(1, 2),
-                timestep=timestep * 0,
-                action=None,
-                timestep_action=None,
-                state=None,
-                embodiment_id=None,
-                context=prompt_embs,
-                seq_len=seq_len,
-                y=y,
-                clip_feature=self.clip_feas,
-                kv_caches=kv_caches,
-                crossattn_caches=crossattn_caches,
-                kv_cache_metadata=dict(
-                    start_frame=self.current_start_frame - self.num_frame_per_block,
-                    update_kv_cache=True,
-                ),
+            crossattn_caches = self._get_caches(
+                [self.crossattn_cache, self.crossattn_cache_neg],
             )
 
-        end_kv_event.record()
+            start_kv_event.record()
+
+            # KV warmup does not contribute to PPO grad; no_grad saves activation memory on update.
+            kv_warmup_ctx = (
+                torch.no_grad() if rl_mode == "log_prob" else contextlib.nullcontext()
+            )
+
+            if self.current_start_frame == 0:
+                timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
+                with kv_warmup_ctx:
+                    self._run_diffusion_steps(
+                        noisy_input=image.transpose(1, 2),
+                        timestep=timestep * 0,
+                        action=None,
+                        timestep_action=None,
+                        state=None,
+                        embodiment_id=None,
+                        context=prompt_embs,
+                        seq_len=frame_seqlen,
+                        y=self.ys[:, :, 0:1],
+                        clip_feature=self.clip_feas,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        kv_cache_metadata=dict(
+                            start_frame=0,
+                            update_kv_cache=True,
+                        ),
+                    )
+                self.current_start_frame += 1
+
+            timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
+
+            if self.current_start_frame != 1:
+                current_ref_latents = image[:, -self.num_frame_per_block:]
+                if self.current_start_frame <= self.ys.shape[2]:
+                    y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
+                else:
+                    y = self.ys[:, :, -self.num_frame_per_block:]
+                with kv_warmup_ctx:
+                    self._run_diffusion_steps(
+                        noisy_input=current_ref_latents.transpose(1, 2),
+                        timestep=timestep * 0,
+                        action=None,
+                        timestep_action=None,
+                        state=None,
+                        embodiment_id=None,
+                        context=prompt_embs,
+                        seq_len=seq_len,
+                        y=y,
+                        clip_feature=self.clip_feas,
+                        kv_caches=kv_caches,
+                        crossattn_caches=crossattn_caches,
+                        kv_cache_metadata=dict(
+                            start_frame=self.current_start_frame - self.num_frame_per_block,
+                            update_kv_cache=True,
+                        ),
+                    )
+
+            end_kv_event.record()
+
+            if rl_mode == "trace" and self.current_start_frame >= 1:
+                flow_cond_cache_out = _pack_flow_cond_cache(
+                    prompt_embs=prompt_embs,
+                    clip_feas=self.clip_feas,
+                    ys=self.ys,
+                    current_start_frame=self.current_start_frame,
+                    batch_size=batch_size,
+                    frame_seqlen=frame_seqlen,
+                    seq_len=seq_len,
+                )
+        else:
+            assert self.kv_cache1 is not None
+            assert self.kv_cache_neg is not None
+            assert self.crossattn_cache is not None
+            assert self.crossattn_cache_neg is not None
+            kv_caches = self._get_caches(
+                [self.kv_cache1, self.kv_cache_neg],
+            )
+            crossattn_caches = self._get_caches(
+                [self.crossattn_cache, self.crossattn_cache_neg],
+            )
+            end_kv_event.record()
 
         noisy_input = noise_obs
         noisy_input_action = noise_action
@@ -1534,6 +1806,7 @@ class WANPolicyHead(ActionHead):
                         "video_flow_eps": torch.stack(trace_video_eps, dim=0),
                         "flow_log_prob": flow_log_prob_total,
                         "action_flow_log_prob": flow_log_prob_total,
+                        "flow_cond_cache": flow_cond_cache_out,
                     }
                     if rl_mode == "trace" and trace_action_path
                     else {}
@@ -1567,9 +1840,9 @@ class WANPolicyHead(ActionHead):
         base_model = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
         if hasattr(base_model, "post_initialize"):
             base_model.post_initialize()
-        self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
-        self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
-        self.vae.to(device=self._device, dtype=torch.bfloat16)
+        for mod in (self.text_encoder, self.image_encoder, self.vae):
+            if mod is not None:
+                mod.to(device=self._device, dtype=torch.bfloat16)
         import os
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
@@ -1584,20 +1857,22 @@ class WANPolicyHead(ActionHead):
 
         # Torch compile the modules. Skip _forward_blocks: Dynamo with fullgraph can fail on
         # shape variation (e.g. x [1,50,C] vs e [1,200,C]); the block aligns e to x at runtime.
-        if not skip_compile:
+        if not skip_compile and self.text_encoder is not None:
             print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
 
             self.text_encoder.forward = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.text_encoder.forward)
 
-            self.image_encoder.model.visual.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.image_encoder.model.visual.forward)
+            if self.image_encoder is not None:
+                self.image_encoder.model.visual.forward = torch.compile(
+                    mode="reduce-overhead", fullgraph=True, dynamic=False,
+                )(self.image_encoder.model.visual.forward)
 
-            self.vae.model.encode = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.vae.model.encode)
+            if self.vae is not None:
+                self.vae.model.encode = torch.compile(
+                    mode="reduce-overhead", fullgraph=True, dynamic=False,
+                )(self.vae.model.encode)
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:

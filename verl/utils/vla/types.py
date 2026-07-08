@@ -18,3 +18,4 @@ class StepOutput:
     flow_eps: np.ndarray | None = None  # [K, H, D]
     video_flow_path: np.ndarray | None = None
     video_flow_eps: np.ndarray | None = None
+    flow_cond: dict | None = None

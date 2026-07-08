@@ -157,6 +157,7 @@ class ImaginationRollout:
                         video_flow_path=out.video_flow_path,
                         video_flow_eps=out.video_flow_eps,
                         flow_log_prob=float(flow_lp) if flow_lp is not None else None,
+                        flow_cond=out.flow_cond,
                     )
                 )
                 append_imagined_frame(frame_buffers, out.video_frames)

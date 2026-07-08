@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from verl.workers.rollout.imagination.policy.runner import PolicyRunner
+from verl.utils.vla.log_prob_utils import build_rollout_log_prob_tensors
 from verl.utils.vla.proto_adapter import trajectories_to_dataproto
 from verl.workers.rollout.dreamzero_backend import DreamZeroInProcessBackend
 from verl.utils.vla.dreamzero_policy import DreamZeroPolicyModule
@@ -85,5 +86,22 @@ class DreamZeroRollout(BaseRollout):
             action_dim=self.action_dim,
             device=self.device,
         )
+        max_wm = max(len(t.chunks) for t in trajectories)
+        max_wm = max(max_wm, 1)
+        action_flat = self.action_horizon * self.action_dim
+        if self.policy_module is not None:
+            built = build_rollout_log_prob_tensors(
+                trajectories,
+                max_wm,
+                action_flat,
+                device=self.device,
+                action_sigma=float(self.policy_module.flow_rl_sigma),
+                video_sigma=float(self.policy_module.flow_rl_video_sigma),
+            )
+            if built is not None:
+                per_step, old_log_probs, scalar = built
+                proto.batch["old_log_probs"] = old_log_probs
+                proto.batch["rollout_log_probs"] = per_step
+                proto.batch["rollout_log_prob_scalar"] = scalar
         proto.batch["state_id"] = prompts.batch["state_id"].repeat_interleave(n_samples, dim=0)
         return proto

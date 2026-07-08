@@ -17,6 +17,7 @@ class ChunkRecord:
     video_flow_path: np.ndarray | None = None
     video_flow_eps: np.ndarray | None = None
     flow_log_prob: float | None = None
+    flow_cond: dict | None = None
 
 
 @dataclass
